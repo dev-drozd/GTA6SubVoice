@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 APP_NAME = "GTA6SubVoice"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 
 REPO_URL = "https://github.com/dev-drozd/GTA6SubVoice"
 AUTHOR_NAME = "Oleksandr Drozd"

@@ -1317,7 +1317,7 @@ class MainWindow(QMainWindow):
         self.pipeline.apply_config(cfg)
         self._schedule_auto_save()
 
-    def _toggle_start_stop(self) -> None:
+    def _toggle_start_stop(self, _checked: bool = False, *, from_hotkey: bool = False) -> None:
         if not self.pipeline.is_running:
             target_proc = self._current_target_process()
             if not target_proc:
@@ -1333,6 +1333,9 @@ class MainWindow(QMainWindow):
             self.btn_start_stop.setObjectName("primaryStop")
             self.header_bar.set_live_shimmer(True)
             self.tray.set_active(True, "Слушаю субтитры")
+            if from_hotkey and self.isVisible():
+                self.hide()
+                self._refresh_own_hwnds()
         else:
             self.btn_start_stop.setText("  Старт озвучки (F8)")
             self.btn_start_stop.setIcon(svg_icon("play", "#FFFFFF", 14))
@@ -1344,7 +1347,7 @@ class MainWindow(QMainWindow):
 
     def _on_global_hotkey(self, action: str) -> None:
         if action == "toggle_pause":
-            self._toggle_start_stop()
+            self._toggle_start_stop(from_hotkey=True)
         elif action == "select_roi":
             self.open_roi_selector()
         elif action == "interrupt":

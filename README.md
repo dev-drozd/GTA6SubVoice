@@ -9,14 +9,16 @@
   Бесплатная программа с открытым исходным кодом для озвучки русских субтитров GTA VI в реальном времени.<br />
   Работает на Windows с трансляцией <b>Xbox Series X|S</b>, <b>PlayStation 5</b>, картами видеозахвата и будущей <b>ПК-версией</b>.
 </p>
-
 <p align="center">
-  <a href="https://www.youtube.com/watch?v=QdBZY2fkU-0" target="_blank">
-    <img src="https://img.youtube.com/vi/QdBZY2fkU-0/maxresdefault.jpg" alt="Демонстрация работы GTA6SubVoice на YouTube" width="640" />
+  <a href="https://www.youtube.com/watch?v=Hf-AnOoweys" target="_blank">
+    <img src="https://img.youtube.com/vi/Hf-AnOoweys/maxresdefault.jpg" alt="Демонстрация работы GTA6SubVoice на YouTube" width="640" />
   </a>
   <br />
   <sub>Видео-демонстрация работы на YouTube</sub>
 </p>
+
+
+
 
 ---
 
@@ -81,6 +83,8 @@
 - **ОЗУ:** от 8 ГБ *(программа занимает ~850–900 МБ)*
 - **Видеокарта:** любая *(GPU не используется)*
 - **Диск:** ~1.2 ГБ свободного места
+
+При запуске программа автоматически проверяет компьютер на соответствие этим требованиям и предупреждает в отдельном окне, если система не подходит.
 
 ---
 
