@@ -42,7 +42,7 @@ def run_smoke_test(out_path: str | None = None) -> int:
 
     if not preflight.all_ready:
         report = {
-            "status": "SETUP_REQUIRED",
+            "status": "MISSING_MODELS",
             "frozen": bool(getattr(sys, "frozen", False)),
             "executable": sys.executable,
             "app_dir": str(APP_DIR),
@@ -52,7 +52,7 @@ def run_smoke_test(out_path: str | None = None) -> int:
             "ram_mb": round(proc.memory_info().rss / (1024 * 1024), 1),
         }
         _write_report(report, out_path)
-        return 0
+        return 1
 
     stress_dict = StressDictManager()
     tts = SileroTTSEngine(
@@ -156,7 +156,6 @@ def main() -> int:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--smoke-out", type=str, default=None)
-    parser.add_argument("--check-wizard-dialog", action="store_true")
     parser.add_argument("--check-ui-modes", action="store_true")
     parser.add_argument("--skip-system-check", action="store_true")
     args, _unknown = parser.parse_known_args()
@@ -214,7 +213,7 @@ def main() -> int:
 
     # Запрещаем одновременный запуск 2+ копий приложения (пропускаем только для автоматических CLI-проверок)
     instance_guard = None
-    if not (args.check_ui_modes or args.check_wizard_dialog):
+    if not args.check_ui_modes:
         instance_guard = SingleInstanceGuard("GTA6SubVoice_SingleInstance_v1")
         if not instance_guard.acquire():
             return 0
@@ -257,13 +256,7 @@ def main() -> int:
 
         QTimer.singleShot(400, _verify_modes)
     else:
-        QTimer.singleShot(
-            25,
-            lambda: window.start_bootstrap(
-                check_wizard_only=bool(args.check_wizard_dialog),
-                smoke_out=args.smoke_out,
-            ),
-        )
+        QTimer.singleShot(25, window.start_bootstrap)
 
     rc = app.exec()
     hotkey_mgr.unregister_all()

@@ -51,7 +51,6 @@ from src.pipeline import PipelineLogEvent, SubtitlePipeline
 from src.text_filter import StressDictManager
 from src.ui.icons import svg_icon
 from src.ui.roi_overlay import RoiOverlay
-from src.ui.setup_dialog import SetupDialog
 from src.ui.styles import DARK_STYLESHEET
 from src.ui.support_dialog import SupportDialog
 from src.ui.tray import TrayController, build_app_icon
@@ -334,54 +333,28 @@ class MainWindow(QMainWindow):
         self._refresh_own_hwnds()
 
     # ------------------------------------------------------------------ Инициализация при запуске
-    def start_bootstrap(self, check_wizard_only: bool = False, smoke_out: Optional[str] = None) -> None:
+    def start_bootstrap(self) -> None:
         self._show_loading_banner("Проверка локальных моделей и аудиоустройств...")
         preflight = self.dep_mgr.run_preflight(ocr_engine=self.cfg_mgr.config.ocr_engine, verify_hash=False)
         self._refresh_components_table(verify_hash=False)
         self._populate_audio_devices()
-
-        if not preflight.all_ready:
-            self._show_loading_banner("Требуется установка компонентов...")
-            dlg = SetupDialog(self.dep_mgr, preflight, parent=self)
-            if check_wizard_only:
-                import json
-
-                QTimer.singleShot(1200, dlg.reject)
-                dlg.exec()
-                if smoke_out:
-                    with open(smoke_out, "w", encoding="utf-8") as f:
-                        json.dump(
-                            {
-                                "status": "WIZARD_OPENED",
-                                "missing": [c.spec.id for c in preflight.missing_for_launch],
-                                "title": dlg.windowTitle(),
-                            },
-                            f,
-                            ensure_ascii=False,
-                            indent=2,
-                        )
-                self.quit_application()
-                return
-
-            res = dlg.exec()
-            if res == QDialog.DialogCode.Accepted:
-                if dlg.switched_to_winrt:
-                    self.cfg_mgr.config.ocr_engine = "winrt"
-                found = find_silero_model(None)
-                if found:
-                    self.cfg_mgr.config.silero_model_path = to_portable_path(found)
-                self.cfg_mgr.save()
-                self._sync_ui_from_config()
-                self.pipeline.apply_config(self.cfg_mgr.config)
-            preflight = self.dep_mgr.run_preflight(ocr_engine=self.cfg_mgr.config.ocr_engine, verify_hash=False)
-            self._refresh_components_table(verify_hash=False)
 
         silero_ready = any(c.spec.id == "silero_v5_6" and c.status == "installed" for c in preflight.components)
         if silero_ready:
             self.pipeline.load_models_async()
         else:
             self._hide_loading_banner()
-            self._on_status_changed("error", "Нет модели Silero")
+            self._on_status_changed("error", "Нет модели Silero (models/v5_6_ru.pt)")
+            self._on_log_event(
+                PipelineLogEvent(
+                    "ERR",
+                    "error",
+                    "—",
+                    self.cfg_mgr.config.ocr_engine,
+                    0.0,
+                    "Файл модели Silero не найден в папке models/. Проверьте целостность сборки.",
+                )
+            )
 
     def _show_loading_banner(self, text: str) -> None:
         self.lbl_boot_status.setText(text)
@@ -977,20 +950,12 @@ class MainWindow(QMainWindow):
         self.btn_verify_models = QPushButton(" Проверить")
         self.btn_verify_models.setIcon(svg_icon("shield-check", "#00D9B5", 13))
         self.btn_verify_models.setIconSize(QSize(13, 13))
-        self.btn_download_models = QPushButton(" Скачать / Обновить")
-        self.btn_download_models.setIcon(svg_icon("download", "#E3DFF7", 13))
-        self.btn_download_models.setIconSize(QSize(13, 13))
-        self.btn_manual_model = QPushButton(" Файл вручную")
+        self.btn_manual_model = QPushButton(" Файл Silero (.pt) вручную")
         self.btn_manual_model.setIcon(svg_icon("folder-open", "#E3DFF7", 13))
         self.btn_manual_model.setIconSize(QSize(13, 13))
-        self.btn_delete_models = QPushButton(" Удалить")
-        self.btn_delete_models.setIcon(svg_icon("trash-2", "#FFB6C9", 13))
-        self.btn_delete_models.setIconSize(QSize(13, 13))
-        self.btn_delete_models.setObjectName("dangerBtn")
         comp_btns.addWidget(self.btn_verify_models)
-        comp_btns.addWidget(self.btn_download_models)
         comp_btns.addWidget(self.btn_manual_model)
-        comp_btns.addWidget(self.btn_delete_models)
+        comp_btns.addStretch(1)
         cg_lay.addLayout(comp_btns)
         layout.addWidget(comp_group)
 
@@ -1098,9 +1063,7 @@ class MainWindow(QMainWindow):
         self.btn_reset_defaults.clicked.connect(self._on_reset_defaults)
 
         self.btn_verify_models.clicked.connect(self._on_verify_models)
-        self.btn_download_models.clicked.connect(self._on_open_setup_wizard)
         self.btn_manual_model.clicked.connect(self._on_manual_install_silero)
-        self.btn_delete_models.clicked.connect(self._on_delete_downloaded_models)
 
         self.pipeline.status_changed.connect(self._on_status_changed)
         self.pipeline.loading_progress.connect(self._show_loading_banner)
@@ -1841,23 +1804,6 @@ class MainWindow(QMainWindow):
         self._refresh_components_table(verify_hash=True)
         QMessageBox.information(self, "Проверка целостности", "Проверка размеров, заголовков и SHA-256 завершена.")
 
-    def _on_open_setup_wizard(self) -> None:
-        report = self.dep_mgr.run_preflight(ocr_engine=self.cfg_mgr.config.ocr_engine, verify_hash=False)
-        dlg = SetupDialog(self.dep_mgr, report, parent=self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            if dlg.switched_to_winrt:
-                self.cfg_mgr.config.ocr_engine = "winrt"
-                self.cfg_mgr.save()
-                self._sync_ui_from_config()
-                self.pipeline.apply_config(self.cfg_mgr.config)
-            found = find_silero_model(None)
-            if found:
-                self.cfg_mgr.config.silero_model_path = to_portable_path(found)
-                self.cfg_mgr.save()
-                self.edit_model_path.setText(self.cfg_mgr.config.silero_model_path)
-                self.pipeline.load_models_async()
-        self._refresh_components_table(verify_hash=False)
-
     def _on_manual_install_silero(self) -> None:
         path_str, _ = QFileDialog.getOpenFileName(
             self,
@@ -1879,26 +1825,6 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Модель установлена", msg)
         else:
             QMessageBox.warning(self, "Ошибка", msg)
-
-    def _on_delete_downloaded_models(self) -> None:
-        ans = QMessageBox.question(
-            self,
-            "Удалить скачанные модели",
-            "Удалить модели Silero и RapidOCR из папки models/? Их можно будет скачать снова в любой момент.",
-        )
-        if ans != QMessageBox.StandardButton.Yes:
-            return
-        if self.pipeline.is_running:
-            self._toggle_start_stop()
-        removed = 0
-        for spec in self.dep_mgr.manifest:
-            removed += self.dep_mgr.remove_component(spec.id)
-        self.pipeline.tts.unload()
-        self.pipeline._status_audio_cache.clear()
-        self._on_status_changed("error", "Нет модели Silero")
-        self._refresh_components_table(verify_hash=False)
-        self._update_ram_label()
-        QMessageBox.information(self, "Очистка завершена", f"Удалено файлов моделей: {removed}.")
 
     # ------------------------------------------------------------------ Персонажи и словарь ударений
     def _refresh_characters_table(self) -> None:

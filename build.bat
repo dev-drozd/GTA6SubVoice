@@ -2,23 +2,26 @@
 setlocal enabledelayedexpansion
 chcp 65001 >nul
 
-set "BUILD_MODE=full"
-if /I "%~1"=="--lite" set "BUILD_MODE=lite"
-if /I "%~1"=="--full" set "BUILD_MODE=full"
-
-if /I "%BUILD_MODE%"=="lite" (
-    set "OUT_DIR=dist\GTA6SubVoice_lite"
-) else (
-    set "OUT_DIR=dist\GTA6SubVoice"
-)
+set "OUT_DIR=dist\GTA6SubVoice"
 
 echo ============================================================
-echo  GTA6SubVoice - Studio Build (--onedir, CPU-only, mode=%BUILD_MODE%)
+echo  GTA6SubVoice - Build (--onedir, CPU-only, autonomous)
 echo ============================================================
 
 set "VENV_PY=.venv\Scripts\python.exe"
 if not exist "%VENV_PY%" (
     echo [ERROR] Virtual environment .venv not found!
+    exit /b 1
+)
+
+if not exist "models\v5_6_ru.pt" (
+    echo [ERROR] Model models\v5_6_ru.pt not found!
+    echo Run: %VENV_PY% -m src.dependency_manager --download-all
+    exit /b 1
+)
+if not exist "models\ocr\ch_PP-OCRv5_mobile_det.onnx" (
+    echo [ERROR] OCR models in models\ocr\ not found!
+    echo Run: %VENV_PY% -m src.dependency_manager --download-all
     exit /b 1
 )
 
@@ -33,11 +36,12 @@ if exist "tests" (
     echo [1/4] Skipping pytest ^(tests/ folder not present^)...
 )
 
-echo [2/4] Cleaning previous build artifacts for mode=%BUILD_MODE%...
+echo [2/4] Cleaning previous build artifacts...
 taskkill /IM GTA6SubVoice.exe /F >nul 2>&1
 ping -n 2 127.0.0.1 >nul
 if exist build rmdir /s /q build
 if exist "%OUT_DIR%" rmdir /s /q "%OUT_DIR%"
+if exist "dist\GTA6SubVoice_lite" rmdir /s /q "dist\GTA6SubVoice_lite"
 
 echo [3/4] Compiling with PyInstaller (--onedir --windowed)...
 "%VENV_PY%" -m PyInstaller ^
@@ -98,12 +102,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-if /I "%BUILD_MODE%"=="lite" (
-    if exist "dist\GTA6SubVoice_lite" rmdir /s /q "dist\GTA6SubVoice_lite"
-    move /Y "dist\GTA6SubVoice" "dist\GTA6SubVoice_lite" >nul
-)
-
-echo [4/4] Packaging data/, icons/ and models/ for mode=%BUILD_MODE% into %OUT_DIR%...
+echo [4/4] Packaging data/, icons/ and models/ into %OUT_DIR%...
 xcopy /E /I /Y "data" "%OUT_DIR%\data" >nul
 if not exist "%OUT_DIR%\icons" mkdir "%OUT_DIR%\icons"
 if exist "icons\GTA6SubVoice_icon.ico" copy /Y "icons\GTA6SubVoice_icon.ico" "%OUT_DIR%\icons\GTA6SubVoice_icon.ico" >nul
@@ -116,17 +115,8 @@ if not exist "%OUT_DIR%\models\ocr" mkdir "%OUT_DIR%\models\ocr"
 if exist "models\subtitle_font_clf.onnx" (
     copy /Y "models\subtitle_font_clf.onnx" "%OUT_DIR%\models\subtitle_font_clf.onnx" >nul
 )
-
-if /I "%BUILD_MODE%"=="full" (
-    if exist "models\v5_6_ru.pt" (
-        copy /Y "models\v5_6_ru.pt" "%OUT_DIR%\models\v5_6_ru.pt" >nul
-    )
-    if exist "models\ocr" (
-        xcopy /E /I /Y "models\ocr" "%OUT_DIR%\models\ocr" >nul
-    )
-) else (
-    echo [INFO] --lite mode: models/ kept empty - Setup Wizard will download on user consent.
-)
+copy /Y "models\v5_6_ru.pt" "%OUT_DIR%\models\v5_6_ru.pt" >nul
+xcopy /E /I /Y "models\ocr" "%OUT_DIR%\models\ocr" >nul
 
 echo.
 echo [CHECK] Verifying %OUT_DIR%\GTA6SubVoice.exe ...
@@ -135,5 +125,5 @@ if not exist "%OUT_DIR%\GTA6SubVoice.exe" (
     exit /b 1
 )
 
-echo [SUCCESS] Build (%BUILD_MODE%) completed: %OUT_DIR%\GTA6SubVoice.exe
+echo [SUCCESS] Build completed: %OUT_DIR%\GTA6SubVoice.exe
 exit /b 0
