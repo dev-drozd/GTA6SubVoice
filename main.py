@@ -103,6 +103,11 @@ def run_smoke_test(out_path: str | None = None) -> int:
     ocr.warmup()
     ocr.close()
 
+    # Проверка минимальных системных требований
+    from src.system_check import check_system_requirements
+
+    sys_report = check_system_requirements()
+
     # Проверка стека Windows WASAPI Auto-Ducking COM внутри собранного exe
     from src.ducking import AutoDucker, list_active_audio_processes
 
@@ -121,6 +126,7 @@ def run_smoke_test(out_path: str | None = None) -> int:
         "executable": sys.executable,
         "app_dir": str(APP_DIR),
         "portable_mode": PORTABLE_MODE,
+        "system_check_ok": sys_report.ok,
         "ui_mode_default": cfg.ui_mode,
         "voice_mode_default": cfg.voice_mode,
         "sample_rate": 48000,
@@ -152,6 +158,7 @@ def main() -> int:
     parser.add_argument("--smoke-out", type=str, default=None)
     parser.add_argument("--check-wizard-dialog", action="store_true")
     parser.add_argument("--check-ui-modes", action="store_true")
+    parser.add_argument("--skip-system-check", action="store_true")
     args, _unknown = parser.parse_known_args()
 
     if args.smoke_test:
@@ -169,6 +176,33 @@ def main() -> int:
         except Exception:
             pass
 
+    from src.system_check import check_system_requirements
+    from src.ui.tray import build_app_icon
+
+    app = QApplication(sys.argv)
+    app.setApplicationName("GTA6SubVoice")
+    app.setWindowIcon(build_app_icon(active=False))
+    app.setQuitOnLastWindowClosed(False)
+
+    # Проверяем минимальные требования ПК до загрузки тяжёлых моделей и запуска конвейера
+    if not args.skip_system_check:
+        sys_report = check_system_requirements()
+        if not sys_report.ok:
+            from src.ui.system_check_dialog import SystemRequirementsDialog
+
+            if args.smoke_out:
+                _write_report(
+                    {
+                        "status": "SYSTEM_UNSUPPORTED",
+                        "failed": [it.key for it in sys_report.failed_items],
+                        "summary": sys_report.summary_text(),
+                    },
+                    args.smoke_out,
+                )
+            dlg = SystemRequirementsDialog(sys_report)
+            dlg.exec()
+            return 1
+
     from src.config import ConfigManager
     from src.dependency_manager import DependencyManager
     from src.hotkeys import GlobalHotkeyManager
@@ -176,7 +210,6 @@ def main() -> int:
     from src.single_instance import SingleInstanceGuard
     from src.text_filter import StressDictManager
     from src.ui.main_window import MainWindow
-    from src.ui.tray import build_app_icon
     from src.voice_manager import VoiceManager
 
     app = QApplication(sys.argv)
