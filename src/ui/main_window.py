@@ -54,6 +54,8 @@ from src.ui.roi_overlay import RoiOverlay
 from src.ui.styles import DARK_STYLESHEET
 from src.ui.support_dialog import SupportDialog
 from src.ui.tray import TrayController, build_app_icon
+from src.ui.update_dialog import UpdateCheckThread, UpdateDialog
+from src.version import APP_VERSION
 from src.ui.widgets import (
     AnimatedStatusBadge,
     TactileSlider,
@@ -333,6 +335,14 @@ class MainWindow(QMainWindow):
         self._update_ram_label()
         self._refresh_own_hwnds()
 
+        # Фоновая проверка обновлений на GitHub при старте
+        self._update_check_thread: Optional[UpdateCheckThread] = None
+        self._startup_update_checked = False
+        self._update_timer = QTimer(self)
+        self._update_timer.setSingleShot(True)
+        self._update_timer.setInterval(1500)
+        self._update_timer.timeout.connect(lambda: self._start_update_check(manual=False))
+
     # ------------------------------------------------------------------ Инициализация при запуске
     def start_bootstrap(self) -> None:
         self._show_loading_banner("Проверка локальных моделей и аудиоустройств...")
@@ -356,6 +366,9 @@ class MainWindow(QMainWindow):
                     "Файл модели Silero не найден в папке models/. Проверьте целостность сборки.",
                 )
             )
+        if not self._startup_update_checked:
+            self._startup_update_checked = True
+            self._update_timer.start()
 
     def _show_loading_banner(self, text: str) -> None:
         self.lbl_boot_status.setText(text)
@@ -997,6 +1010,28 @@ class MainWindow(QMainWindow):
         pg_lay.addWidget(self.btn_reset_defaults)
         layout.addWidget(prof_group)
 
+        # 7. О программе и обновления
+        about_group = QGroupBox("Обновления и версия программы")
+        ab_lay = QHBoxLayout(about_group)
+        ab_lay.setSpacing(10)
+
+        ver_col = QVBoxLayout()
+        ver_col.setSpacing(2)
+        self.lbl_app_version = QLabel(f"Текущая версия: v{APP_VERSION}")
+        self.lbl_app_version.setStyleSheet("font-weight: 700; color: #FFFFFF; font-size: 12px;")
+        self.lbl_update_status = QLabel("Автопроверка обновлений с GitHub при запуске включена")
+        self.lbl_update_status.setStyleSheet("color: #9A96B0; font-size: 11px;")
+        ver_col.addWidget(self.lbl_app_version)
+        ver_col.addWidget(self.lbl_update_status)
+        ab_lay.addLayout(ver_col, 1)
+
+        self.btn_check_updates = QPushButton(" Проверить обновления")
+        self.btn_check_updates.setIcon(svg_icon("refresh-cw", "#00D9B5", 13))
+        self.btn_check_updates.setIconSize(QSize(13, 13))
+        self.btn_check_updates.setMinimumHeight(30)
+        ab_lay.addWidget(self.btn_check_updates)
+        layout.addWidget(about_group)
+
         layout.addStretch()
         scroll.setWidget(container)
         self.tabs.addTab(scroll, svg_icon("settings", "#C7C2DC", 13), "Настройки")
@@ -1068,6 +1103,7 @@ class MainWindow(QMainWindow):
 
         self.btn_verify_models.clicked.connect(self._on_verify_models)
         self.btn_manual_model.clicked.connect(self._on_manual_install_silero)
+        self.btn_check_updates.clicked.connect(lambda: self._start_update_check(manual=True))
 
         self.pipeline.status_changed.connect(self._on_status_changed)
         self.pipeline.loading_progress.connect(self._show_loading_banner)
@@ -2099,6 +2135,56 @@ class MainWindow(QMainWindow):
         else:
             self.bring_to_front()
 
+    # ------------------------------------------------------------------ Обновления (GitHub Releases)
+    def _start_update_check(self, manual: bool = False) -> None:
+        if self._did_shutdown:
+            return
+        if self._update_check_thread is not None and self._update_check_thread.isRunning():
+            return
+        if manual:
+            self.btn_check_updates.setEnabled(False)
+            self.btn_check_updates.setText(" Проверяю...")
+            self.lbl_update_status.setText("Проверяю наличие обновлений на GitHub...")
+            self.lbl_update_status.setStyleSheet("color: #9A96B0; font-size: 11px;")
+
+        th = UpdateCheckThread(manual=manual, parent=self)
+        th.checked.connect(self._on_update_check_done)
+        self._update_check_thread = th
+        th.start()
+
+    def _on_update_check_done(self, release_obj: object, err_msg: str, manual: bool) -> None:
+        self.btn_check_updates.setEnabled(True)
+        self.btn_check_updates.setText(" Проверить обновления")
+        if self._did_shutdown:
+            return
+
+        if err_msg:
+            if manual:
+                self.lbl_update_status.setText("Не удалось проверить обновления")
+                self.lbl_update_status.setStyleSheet("color: #FF9F43; font-size: 11px;")
+                QMessageBox.warning(
+                    self,
+                    "Ошибка проверки обновлений",
+                    f"Не удалось получить данные о релизах с GitHub:\n{err_msg}",
+                )
+            return
+
+        if release_obj is None:
+            self.lbl_update_status.setText(f"Установлена актуальная версия (v{APP_VERSION})")
+            self.lbl_update_status.setStyleSheet("color: #00E5C3; font-size: 11px;")
+            if manual:
+                QMessageBox.information(
+                    self,
+                    "Обновлений нет",
+                    f"У вас уже установлена последняя версия GTA6SubVoice (v{APP_VERSION}).",
+                )
+            return
+
+        self.lbl_update_status.setText(f"Доступна новая версия: v{release_obj.version}")
+        self.lbl_update_status.setStyleSheet("color: #FF8754; font-size: 11px; font-weight: 600;")
+        dlg = UpdateDialog(release_obj, on_restart_requested=self.quit_application, parent=self)
+        dlg.exec()
+
     def _perform_clean_shutdown(self) -> None:
         if self._did_shutdown:
             return
@@ -2109,9 +2195,14 @@ class MainWindow(QMainWindow):
                 self.cfg_mgr.save()
         except Exception:
             pass
-        for tm in (self._reload_model_timer, self._ram_timer):
+        for tm in (self._reload_model_timer, self._ram_timer, self._update_timer):
             try:
                 tm.stop()
+            except Exception:
+                pass
+        if self._update_check_thread is not None and self._update_check_thread.isRunning():
+            try:
+                self._update_check_thread.wait(800)
             except Exception:
                 pass
         if self._roi_overlay is not None:
