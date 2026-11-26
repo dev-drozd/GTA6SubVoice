@@ -375,7 +375,11 @@ class DependencyManager:
                     pass
 
         make_client = client_factory or (
-            lambda: httpx.Client(follow_redirects=True, timeout=httpx.Timeout(25.0, connect=15.0))
+            lambda: httpx.Client(
+                follow_redirects=True,
+                timeout=httpx.Timeout(45.0, connect=20.0),
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) GTA6SubVoice/1.0"},
+            )
         )
 
         try:
@@ -512,3 +516,50 @@ class DependencyManager:
             return False, f"Ошибка сети: {exc}. Можно продолжить докачку кнопкой «Повторить»."
         except Exception as exc:
             return False, f"Ошибка установки: {exc}"
+
+
+def _cli_download_all() -> int:
+    """Скачивает и проверяет по SHA-256 все модели (для сборки полной версии в CI)."""
+    import sys
+
+    def _make_ci_client() -> httpx.Client:
+        return httpx.Client(
+            follow_redirects=True,
+            timeout=httpx.Timeout(60.0, connect=30.0),
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) GTA6SubVoice-CI/1.0"},
+        )
+
+    dm = DependencyManager()
+    for comp_id in ("silero_v5_6", "rapidocr_cyrillic"):
+        ok = False
+        last_msg = ""
+        for attempt in range(1, 5):
+            print(f"Downloading {comp_id} (attempt {attempt}/4)...", flush=True)
+            ok, last_msg = dm.download_components(
+                [comp_id],
+                verify_sha256=True,
+                client_factory=_make_ci_client,
+            )
+            print(f"  result: ok={ok}, msg={last_msg}", flush=True)
+            if ok:
+                break
+            time.sleep(3 * attempt)
+        if not ok:
+            print(f"::error::Model download failed ({comp_id}): {last_msg}", flush=True)
+            return 1
+
+    report = dm.run_preflight(ocr_engine="rapidocr", verify_hash=True)
+    for item in report.components:
+        print(f"  {item.spec.id}: {item.status} ({item.message})", flush=True)
+    if not report.all_ready:
+        print("::error::Downloaded models failed SHA-256 preflight!", flush=True)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+
+    if "--download-all" in sys.argv:
+        raise SystemExit(_cli_download_all())
+

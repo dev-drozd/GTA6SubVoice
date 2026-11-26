@@ -77,7 +77,7 @@ jobs:
       - name: Download & verify Silero v5.6 and RapidOCR models for Full build
         shell: pwsh
         run: |
-          .\.venv\Scripts\python.exe -c "from src.dependency_manager import DependencyManager; dm = DependencyManager(); ok, msg = dm.download_components(['silero_v5_6', 'rapidocr_cyrillic'], verify_sha256=True); print(ok, msg); assert ok, msg; rep = dm.run_preflight(ocr_engine='rapidocr', verify_hash=True); assert rep.all_ready, rep"
+          .\.venv\Scripts\python.exe -m src.dependency_manager --download-all
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build Full portable package (--full)
