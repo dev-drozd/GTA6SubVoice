@@ -1,0 +1,164 @@
+name: Сборка релиза (Windows x64)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Тег релиза (например, v1.0.0; если пусто — берётся из src/version.py)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build Full & Lite Windows x64
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: "requirements.txt"
+
+      - name: Resolve release tag
+        id: meta
+        shell: pwsh
+        run: |
+          $tag = "${{ github.event.inputs.tag }}".Trim()
+          if (-not $tag -and "${{ github.ref_type }}" -eq "tag") {
+            $tag = "${{ github.ref_name }}".Trim()
+          }
+          if (-not $tag) {
+            $ver = python -c "from src.version import APP_VERSION; print(APP_VERSION)"
+            $tag = "v$($ver.Trim())"
+          }
+          if (-not $tag.StartsWith("v")) {
+            $tag = "v$tag"
+          }
+          Write-Output "tag=$tag" >> $env:GITHUB_OUTPUT
+          Write-Host "Release tag: $tag"
+
+      - name: Create .venv and install dependencies
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install --upgrade pip
+          .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build Lite portable package (--lite)
+        shell: pwsh
+        run: |
+          cmd /c build.bat --lite
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify Lite build (--smoke-test)
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath ".\dist\GTA6SubVoice_lite\GTA6SubVoice.exe" `
+            -ArgumentList "--smoke-test", "--smoke-out", "$PWD\smoke_lite.json" `
+            -Wait -PassThru -NoNewWindow
+          if ($p.ExitCode -ne 0) {
+            Write-Error "Lite smoke-test exited with code $($p.ExitCode)"
+            exit $p.ExitCode
+          }
+          Get-Content "$PWD\smoke_lite.json"
+
+      - name: Download & verify Silero v5.6 and RapidOCR models for Full build
+        shell: pwsh
+        run: |
+          .\.venv\Scripts\python.exe -c "from src.dependency_manager import DependencyManager; dm = DependencyManager(); ok, msg = dm.download_components(['silero_v5_6', 'rapidocr_cyrillic'], verify_sha256=True); print(ok, msg); assert ok, msg; rep = dm.run_preflight(ocr_engine='rapidocr', verify_hash=True); assert rep.all_ready, rep"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build Full portable package (--full)
+        shell: pwsh
+        run: |
+          cmd /c build.bat --full
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify Full build (--smoke-test)
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath ".\dist\GTA6SubVoice\GTA6SubVoice.exe" `
+            -ArgumentList "--smoke-test", "--smoke-out", "$PWD\smoke_full.json" `
+            -Wait -PassThru -NoNewWindow
+          if ($p.ExitCode -ne 0) {
+            Write-Error "Full smoke-test exited with code $($p.ExitCode)"
+            exit $p.ExitCode
+          }
+          Get-Content "$PWD\smoke_full.json"
+
+      - name: Package release ZIP archives & SHA-256 checksums
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          New-Item -ItemType Directory -Force -Path "release_artifacts" | Out-Null
+
+          # Оборачиваем Lite-сборку в единую корневую папку GTA6SubVoice\ внутри архива
+          New-Item -ItemType Directory -Force -Path "release_stage\lite" | Out-Null
+          Move-Item -Path "dist\GTA6SubVoice_lite" -Destination "release_stage\lite\GTA6SubVoice"
+          Push-Location "release_stage\lite"
+          7z a -tzip -mx=5 "..\..\release_artifacts\GTA6SubVoice-$env:RELEASE_TAG-win64-lite.zip" "GTA6SubVoice"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
+
+          # Упаковываем Full-сборку с корневой папкой GTA6SubVoice\
+          Push-Location "dist"
+          7z a -tzip -mx=5 "..\release_artifacts\GTA6SubVoice-$env:RELEASE_TAG-win64-full.zip" "GTA6SubVoice"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
+
+          Push-Location "release_artifacts"
+          $hashes = Get-FileHash -Algorithm SHA256 *.zip | ForEach-Object {
+            "$($_.Hash.ToLower())  $((Split-Path $_.Path -Leaf))"
+          }
+          $hashes | Out-File -FilePath "SHA256SUMS.txt" -Encoding utf8
+          Get-Content "SHA256SUMS.txt"
+          Get-ChildItem | Select-Object Name, Length
+          Pop-Location
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          $tag = $env:RELEASE_TAG
+          $notesLines = @(
+            "## GTA6SubVoice $tag (Windows x64)",
+            "",
+            "### Какой архив скачать",
+            "- **GTA6SubVoice-$tag-win64-full.zip** — полная автономная сборка (голосовая модель Silero v5.6 и RapidOCR уже внутри, работает сразу без интернета).",
+            "- **GTA6SubVoice-$tag-win64-lite.zip** — облегчённая сборка (мастер установки сам скачает модели при первом запуске).",
+            "",
+            "### Минимальные требования",
+            "- Windows 10 (1903+) / Windows 11 (64-bit)",
+            "- Процессор от 4 потоков с поддержкой AVX2",
+            "- От 8 ГБ ОЗУ"
+          )
+          $notesFile = Join-Path $PWD "release_notes.md"
+          ($notesLines -join "`n") | Out-File -FilePath $notesFile -Encoding utf8
+
+          gh release view "$tag" *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload "$tag" release_artifacts\* --clobber
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            gh release edit "$tag" --title "GTA6SubVoice $tag" --notes-file $notesFile
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } else {
+            gh release create "$tag" release_artifacts\* `
+              --title "GTA6SubVoice $tag" `
+              --notes-file $notesFile
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
