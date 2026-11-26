@@ -1,0 +1,48 @@
+# Виртуальные окружения и кэш Python
+.venv/
+venv/
+env/
+.env
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Артефакты сборки и упаковки
+build/
+dist/
+*.spec
+*.egg-info/
+
+# Тяжёлые веса моделей (скачиваются мастером установки при первом запуске)
+models/*
+!models/subtitle_font_clf.onnx
+*.pt
+*.onnx
+!models/subtitle_font_clf.onnx
+*.part
+
+# Локальные настройки, кэш пользователей и отладочные логи (базовые словари в data/ отслеживаются)
+data/config.json
+data/characters.json
+data/debug_logs/
+*.log
+*.tmp
+*.bak
+smoke*.json
+ui*.json
+wizard*.json
+
+# Юнит-тесты и все Markdown-документы, кроме README.md
+tests/
+*.md
+!README.md
+
+# Метаданные IDE и ОС
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
