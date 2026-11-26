@@ -90,7 +90,7 @@ jobs:
           cmd /c build.bat --full
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Verify Full build (--smoke-test)
+      - name: Verify Full build (--smoke-test & --check-ui-modes)
         shell: pwsh
         run: |
           $p = Start-Process -FilePath ".\dist\GTA6SubVoice\GTA6SubVoice.exe" `
@@ -101,6 +101,15 @@ jobs:
             exit $p.ExitCode
           }
           Get-Content "$PWD\smoke_full.json"
+
+          $pUi = Start-Process -FilePath ".\dist\GTA6SubVoice\GTA6SubVoice.exe" `
+            -ArgumentList "--check-ui-modes", "--smoke-out", "$PWD\smoke_ui.json" `
+            -Wait -PassThru -NoNewWindow
+          if ($pUi.ExitCode -ne 0) {
+            Write-Error "Full UI check exited with code $($pUi.ExitCode)"
+            exit $pUi.ExitCode
+          }
+          Get-Content "$PWD\smoke_ui.json"
 
       - name: Package release ZIP archives & SHA-256 checksums
         shell: pwsh

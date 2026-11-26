@@ -212,11 +212,6 @@ def main() -> int:
     from src.ui.main_window import MainWindow
     from src.voice_manager import VoiceManager
 
-    app = QApplication(sys.argv)
-    app.setApplicationName("GTA6SubVoice")
-    app.setWindowIcon(build_app_icon(active=False))
-    app.setQuitOnLastWindowClosed(False)
-
     # Запрещаем одновременный запуск 2+ копий приложения (пропускаем только для автоматических CLI-проверок)
     instance_guard = None
     if not (args.check_ui_modes or args.check_wizard_dialog):
