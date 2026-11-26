@@ -42,8 +42,8 @@ LATIN_RE = re.compile(r"[A-Za-z]")
 
 
 def clean_character_name(name: str) -> str:
-    """Удаляет мусорные OCR-префиксы вроде 'RK Рэнди' -> 'Рэнди' и нормализует пробелы."""
-    s = " ".join(name.strip().split())
+    """Удаляет мусорные OCR-префиксы вроде 'RK Рэнди' -> 'Рэнди', двоеточия на конце и нормализует пробелы."""
+    s = " ".join(name.strip().split()).rstrip(":;").strip()
     s = GARBAGE_NAME_PREFIX_RE.sub("", s).strip()
     return s
 
@@ -208,10 +208,21 @@ class VoiceManager:
                     counts[prof.speaker] += 1
             return min(pool, key=lambda sp: (counts[sp], pool.index(sp)))
 
+    def _find_existing_key_locked(self, cleaned: str) -> Optional[str]:
+        lower = cleaned.lower()
+        existing_key = self._key_map.get(lower)
+        if existing_key is not None and existing_key in self._profiles:
+            return existing_key
+        folded = lower.replace("ё", "е")
+        for k_low, canon in self._key_map.items():
+            if k_low.replace("ё", "е") == folded and canon in self._profiles:
+                return canon
+        return None
+
     def get_profile(self, speaker_name: str) -> Optional[CharacterVoiceProfile]:
         cleaned = clean_character_name(speaker_name)
         with self._lock:
-            canon = self._key_map.get(cleaned.lower())
+            canon = self._find_existing_key_locked(cleaned)
             if canon is None:
                 return None
             return self._profiles.get(canon)
@@ -231,8 +242,8 @@ class VoiceManager:
 
         lower = cleaned.lower()
         with self._lock:
-            existing_key = self._key_map.get(lower)
-            if existing_key is not None and existing_key in self._profiles:
+            existing_key = self._find_existing_key_locked(cleaned)
+            if existing_key is not None:
                 return self._profiles[existing_key], False
 
             gender = self.gender_detector.detect(cleaned)
@@ -258,7 +269,7 @@ class VoiceManager:
     ) -> tuple[str, Gender, bool]:
         """Подбирает итоговый чистый голос Silero для любого из 3 режимов:
         - 'single': всегда single_speaker (по умолчанию 'eugene')
-        - 'dual_mj': dual_male_speaker / dual_female_speaker по полу персонажа (по умолчанию eugene / kseniya)
+        - 'dual_mj': dual_male_speaker / dual_female_speaker по полу персонажа (или закреплённый вручную голос при locked=True)
         - 'multi': до 5 нативных голосов Silero, сохраняемых для персонажей в characters.json
         Возвращает кортеж (speaker_id, gender, created_new_character).
         """
@@ -280,6 +291,10 @@ class VoiceManager:
             return sp, ("female" if sp in FEMALE_SPEAKERS else "male"), created
 
         if voice_mode == "dual_mj":
+            # Если пользователь вручную закрепил конкретный голос за персонажем в интерфейсе,
+            # применяем его сразу даже в стандартном режиме '2 голоса (М/Ж)'.
+            if profile is not None and profile.locked and profile.speaker in ALL_SILERO_SPEAKERS:
+                return profile.speaker, profile.gender, created
             if gender == "female":
                 sp = dual_female_speaker if dual_female_speaker in ALL_SILERO_SPEAKERS else "kseniya"
             else:
@@ -303,8 +318,8 @@ class VoiceManager:
             return None
         lower = cleaned.lower()
         with self._lock:
-            existing_key = self._key_map.get(lower)
-            if existing_key is not None and existing_key in self._profiles:
+            existing_key = self._find_existing_key_locked(cleaned)
+            if existing_key is not None:
                 prof = self._profiles[existing_key]
                 key = existing_key
             else:
@@ -331,10 +346,12 @@ class VoiceManager:
 
     def delete_profile(self, speaker_name: str) -> bool:
         cleaned = clean_character_name(speaker_name)
-        lower = cleaned.lower()
         with self._lock:
-            existing_key = self._key_map.pop(lower, None)
+            existing_key = self._find_existing_key_locked(cleaned)
             if existing_key is not None and existing_key in self._profiles:
+                for k_low, canon in list(self._key_map.items()):
+                    if canon == existing_key:
+                        self._key_map.pop(k_low, None)
                 del self._profiles[existing_key]
                 self.save()
                 return True

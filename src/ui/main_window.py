@@ -66,6 +66,7 @@ from src.voice_manager import (
     FEMALE_SPEAKERS,
     MALE_SPEAKERS,
     VoiceManager,
+    clean_character_name,
     speaker_display_name,
 )
 
@@ -130,7 +131,7 @@ class AddCharacterDialog(QDialog):
 
     def get_values(self) -> tuple[str, str, str]:
         return (
-            self.edit_name.text().strip(),
+            clean_character_name(self.edit_name.text()),
             str(self.combo_gender.currentData()),
             str(self.combo_voice.currentData()),
         )
@@ -1029,6 +1030,9 @@ class MainWindow(QMainWindow):
         self.btn_add_char.clicked.connect(self._on_add_character_dialog)
         self.btn_clear_chars.clicked.connect(self._on_clear_characters)
         self.btn_add_stress.clicked.connect(self._on_add_stress_entry)
+        self.edit_stress_word.returnPressed.connect(self._on_add_stress_entry)
+        self.edit_stress_repl.returnPressed.connect(self._on_add_stress_entry)
+        self.stress_table.cellDoubleClicked.connect(self._on_stress_table_double_click)
 
         self.btn_browse_model.clicked.connect(self._on_browse_model)
         self.btn_autodetect_model.clicked.connect(self._on_autodetect_model)
@@ -1896,12 +1900,14 @@ class MainWindow(QMainWindow):
         if self._table_updating:
             return
         self.voice_mgr.add_or_update_profile(name, gender=gender)
+        self.pipeline.text_filter.reset_dedup()
         self._refresh_characters_table()
 
     def _on_char_voice_changed(self, name: str, speaker: str) -> None:
         if self._table_updating:
             return
         self.voice_mgr.add_or_update_profile(name, speaker=speaker, locked=True)
+        self.pipeline.text_filter.reset_dedup()
 
     def _on_char_test(self, name: str) -> None:
         prof = self.voice_mgr.get_profile(name)
@@ -1915,6 +1921,7 @@ class MainWindow(QMainWindow):
 
     def _on_char_delete(self, name: str) -> None:
         self.voice_mgr.delete_profile(name)
+        self.pipeline.text_filter.reset_dedup()
         self._refresh_characters_table()
 
     def _on_add_character_dialog(self) -> None:
@@ -1925,6 +1932,8 @@ class MainWindow(QMainWindow):
                 res = self.voice_mgr.add_or_update_profile(name, gender=gender, speaker=sp, locked=True)
                 if res is None:
                     QMessageBox.warning(self, "Некорректное имя", "Введите корректное имя (от 2 букв без случайного смешивания латиницы и кириллицы).")
+                else:
+                    self.pipeline.text_filter.reset_dedup()
                 self._refresh_characters_table()
 
     def _on_clear_characters(self) -> None:
@@ -1935,6 +1944,7 @@ class MainWindow(QMainWindow):
         )
         if ans == QMessageBox.StandardButton.Yes:
             self.voice_mgr.clear_all()
+            self.pipeline.text_filter.reset_dedup()
             self._refresh_characters_table()
 
     def _refresh_stress_table(self) -> None:
@@ -1980,12 +1990,24 @@ class MainWindow(QMainWindow):
         if not word or not repl:
             return
         self.stress_dict.set_entry(word, repl)
+        self.pipeline.text_filter.reset_dedup()
         self.edit_stress_word.clear()
         self.edit_stress_repl.clear()
         self._refresh_stress_table()
 
+    def _on_stress_table_double_click(self, row: int, _col: int) -> None:
+        w_item = self.stress_table.item(row, 0)
+        r_item = self.stress_table.item(row, 1)
+        if w_item is None or r_item is None:
+            return
+        self.edit_stress_word.setText(w_item.text())
+        self.edit_stress_repl.setText(r_item.text())
+        self.edit_stress_repl.setFocus()
+        self.edit_stress_repl.selectAll()
+
     def _on_delete_stress_entry(self, word: str) -> None:
         self.stress_dict.delete_entry(word)
+        self.pipeline.text_filter.reset_dedup()
         self._refresh_stress_table()
 
     # ------------------------------------------------------------------ События конвейера

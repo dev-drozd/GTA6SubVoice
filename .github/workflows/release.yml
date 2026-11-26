@@ -7,7 +7,11 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Тег релиза (например, v1.0.0; если пусто — берётся из src/version.py)"
+        description: "Тег релиза (например, v1.0.2; если пусто — берётся из src/version.py)"
+        required: false
+        default: ""
+      changelog:
+        description: "Описание изменений для релиза на русском (необязательно — иначе берётся из CHANGELOG.txt)"
         required: false
         default: ""
 
@@ -26,6 +30,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
@@ -119,24 +125,17 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+          MANUAL_CHANGELOG: ${{ github.event.inputs.changelog }}
         run: |
           $tag = $env:RELEASE_TAG
-          $notesLines = @(
-            '## GTA6SubVoice {TAG} (Windows x64)',
-            '',
-            'Автономная портативная сборка — скачайте **`GTA6SubVoice-{TAG}-win64.zip`**, распакуйте архив и запустите `GTA6SubVoice.exe` (все модели Silero v5.6 и RapidOCR уже включены).',
-            '',
-            '### Минимальные требования',
-            '- Windows 10 (1903+) / Windows 11 (64-bit)',
-            '- Процессор от 4 потоков с поддержкой AVX2',
-            '- От 8 ГБ ОЗУ'
-          )
           $notesFile = Join-Path $PWD "release_notes.md"
-          (($notesLines -join "`n").Replace('{TAG}', $tag)) | Out-File -FilePath $notesFile -Encoding utf8
+
+          .\.venv\Scripts\python.exe -m src.version --release-notes "$tag" "$notesFile"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           $files = @(Get-ChildItem -Path "release_artifacts" -File | ForEach-Object { $_.FullName })
           if ($files.Count -eq 0) {
-            Write-Error "::error::No release artifacts found to publish!"
+            Write-Host "::error::No release artifacts found to publish!"
             exit 1
           }
 

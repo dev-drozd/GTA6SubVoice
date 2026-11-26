@@ -685,19 +685,36 @@ class StressDictManager:
             return dict(self._entries)
 
     def set_entry(self, word: str, replacement: str) -> None:
-        w = word.strip()
-        r = replacement.strip()
+        w = MULTI_SPACE_RE.sub(" ", word.strip())
+        r = MULTI_SPACE_RE.sub(" ", replacement.strip())
         if not w or not r:
             return
+        lk = _stress_lookup_key(w)
+        if not lk:
+            return
         with self._lock:
+            # Удаляем старые ключи с тем же каноническим видом (другой регистр, ё/е или '+'),
+            # чтобы новое правило из UI побеждало мгновенно без дубликатов в таблице
+            to_drop = [k for k in self._entries if _stress_lookup_key(k) == lk and k != w]
+            for old_k in to_drop:
+                del self._entries[old_k]
             self._entries[w] = r
             self._rebuild_patterns()
             self.save()
 
     def delete_entry(self, word: str) -> bool:
+        lk = _stress_lookup_key(word)
         with self._lock:
+            removed = False
             if word in self._entries:
                 del self._entries[word]
+                removed = True
+            elif lk:
+                to_drop = [k for k in self._entries if _stress_lookup_key(k) == lk]
+                for old_k in to_drop:
+                    del self._entries[old_k]
+                    removed = True
+            if removed:
                 self._rebuild_patterns()
                 self.save()
                 return True
