@@ -144,9 +144,9 @@ jobs:
           $releaseExists = ($LASTEXITCODE -eq 0)
 
           if (-not $releaseExists) {
-            gh release create "$tag" --title "GTA6SubVoice $tag" --notes-file $notesFile
+            gh release create "$tag" --target "$env:GITHUB_SHA" --title "GTA6SubVoice $tag" --notes-file $notesFile
             if ($LASTEXITCODE -ne 0) {
-              Write-Error "::error::gh release create failed for $tag"
+              Write-Host "::error::gh release create failed for $tag"
               exit $LASTEXITCODE
             }
           } else {
@@ -159,7 +159,7 @@ jobs:
             }
             gh release edit "$tag" --title "GTA6SubVoice $tag" --notes-file $notesFile
             if ($LASTEXITCODE -ne 0) {
-              Write-Error "::error::gh release edit failed for $tag"
+              Write-Host "::error::gh release edit failed for $tag"
               exit $LASTEXITCODE
             }
           }
@@ -175,6 +175,6 @@ jobs:
             Start-Sleep -Seconds (5 * $attempt)
           }
           if (-not $uploaded) {
-            Write-Error "::error::Failed to upload release assets after 3 attempts"
+            Write-Host "::error::Failed to upload release assets after 3 attempts"
             exit 1
           }
