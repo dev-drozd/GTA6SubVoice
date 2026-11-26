@@ -134,12 +134,47 @@ jobs:
           $notesFile = Join-Path $PWD "release_notes.md"
           (($notesLines -join "`n").Replace('{TAG}', $tag)) | Out-File -FilePath $notesFile -Encoding utf8
 
-          gh release view "$tag" *> $null
-          if ($LASTEXITCODE -eq 0) {
-            gh release delete "$tag" --yes
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $files = @(Get-ChildItem -Path "release_artifacts" -File | ForEach-Object { $_.FullName })
+          if ($files.Count -eq 0) {
+            Write-Error "::error::No release artifacts found to publish!"
+            exit 1
           }
-          gh release create "$tag" release_artifacts\* `
-            --title "GTA6SubVoice $tag" `
-            --notes-file $notesFile
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          gh release view "$tag" *> $null
+          $releaseExists = ($LASTEXITCODE -eq 0)
+
+          if (-not $releaseExists) {
+            gh release create "$tag" --title "GTA6SubVoice $tag" --notes-file $notesFile
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "::error::gh release create failed for $tag"
+              exit $LASTEXITCODE
+            }
+          } else {
+            $oldAssets = @(gh release view "$tag" --json assets --jq ".assets[].name" 2>$null)
+            foreach ($assetName in $oldAssets) {
+              $cleanName = "$assetName".Trim()
+              if ($cleanName) {
+                gh release delete-asset "$tag" "$cleanName" --yes
+              }
+            }
+            gh release edit "$tag" --title "GTA6SubVoice $tag" --notes-file $notesFile
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "::error::gh release edit failed for $tag"
+              exit $LASTEXITCODE
+            }
+          }
+
+          $uploaded = $false
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            Write-Host "Uploading release assets (attempt $attempt/3)..."
+            gh release upload "$tag" @files --clobber
+            if ($LASTEXITCODE -eq 0) {
+              $uploaded = $true
+              break
+            }
+            Start-Sleep -Seconds (5 * $attempt)
+          }
+          if (-not $uploaded) {
+            Write-Error "::error::Failed to upload release assets after 3 attempts"
+            exit 1
+          }
