@@ -522,6 +522,14 @@ def _cli_download_all() -> int:
     """Скачивает и проверяет по SHA-256 все модели (для сборки полной версии в CI)."""
     import sys
 
+    for stream in (sys.stdout, sys.stderr):
+        reconf = getattr(stream, "reconfigure", None)
+        if callable(reconf):
+            try:
+                reconf(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
     def _make_ci_client() -> httpx.Client:
         return httpx.Client(
             follow_redirects=True,
