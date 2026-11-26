@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 APP_NAME = "GTA6SubVoice"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 
 REPO_URL = "https://github.com/dev-drozd/GTA6SubVoice"
 AUTHOR_NAME = "Oleksandr Drozd"
