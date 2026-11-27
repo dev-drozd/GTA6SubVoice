@@ -82,6 +82,9 @@ class AppConfig:
     font_classifier_enabled: bool = True  # Компактный ONNX-классификатор шрифта (< 1 мс CPU) против текста карты/UI
     announce_status: bool = True
     debug_capture_log: bool = False  # Сохранять JSONL/TXT озвученных субтитров и JPEG-кадры ROI в data/debug_logs/
+    mobile_sync_enabled: bool = False  # Локальный веб-пульт Wi-Fi для смартфона (словари ударений и голоса)
+    mobile_sync_port: int = 8765  # Порт локального веб-пульта
+    mobile_sync_token: str = ""  # Код доступа для подключения смартфона в локальной сети
     hotkeys: HotkeysConfig = field(default_factory=HotkeysConfig)
 
     def to_dict(self) -> dict[str, Any]:
@@ -221,6 +224,14 @@ class AppConfig:
         cfg.font_classifier_enabled = bool(raw.get("font_classifier_enabled", cfg.font_classifier_enabled))
         cfg.announce_status = bool(raw.get("announce_status", cfg.announce_status))
         cfg.debug_capture_log = bool(raw.get("debug_capture_log", cfg.debug_capture_log))
+        cfg.mobile_sync_enabled = bool(raw.get("mobile_sync_enabled", cfg.mobile_sync_enabled))
+        try:
+            port_val = int(raw.get("mobile_sync_port", cfg.mobile_sync_port))
+        except Exception:
+            port_val = cfg.mobile_sync_port
+        cfg.mobile_sync_port = max(1024, min(65535, port_val))
+        raw_tok = str(raw.get("mobile_sync_token", cfg.mobile_sync_token) or "").strip()
+        cfg.mobile_sync_token = "".join(ch for ch in raw_tok if ch.isalnum())[:32]
         return cfg, migrated
 
 

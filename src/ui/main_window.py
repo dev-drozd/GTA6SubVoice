@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import os
 import weakref
+import webbrowser
 from pathlib import Path
 from typing import Optional
 
 import psutil
-from PySide6.QtCore import QSize, Qt, QTimer
+from PySide6.QtCore import QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QCloseEvent, QColor, QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
@@ -46,8 +47,15 @@ from src.config import ConfigManager, RoiConfig, export_profile_bundle, load_pro
 from src.dependency_manager import DependencyManager
 from src.ducking import PRESET_GAME_PROCESSES, list_selectable_processes
 from src.hotkeys import GlobalHotkeyManager
+from src.mobile_companion import (
+    MobileCompanionServer,
+    detect_lan_ips,
+    generate_access_token,
+    open_firewall_port_windows,
+)
 from src.paths import find_silero_model, to_portable_path
 from src.pipeline import PipelineLogEvent, SubtitlePipeline
+from src.qr_code import render_qr_pixmap
 from src.text_filter import StressDictManager
 from src.ui.icons import svg_icon
 from src.ui.roi_overlay import RoiOverlay
@@ -267,6 +275,10 @@ class SelectProcessDialog(QDialog):
 
 
 class MainWindow(QMainWindow):
+    mobile_stress_synced = Signal(str, str, str)
+    mobile_character_synced = Signal(str, str, str, str)
+    mobile_client_activity = Signal(str, int, str)
+
     def __init__(
         self,
         config_manager: ConfigManager,
@@ -303,6 +315,21 @@ class MainWindow(QMainWindow):
         self._reload_model_timer.setSingleShot(True)
         self._reload_model_timer.setInterval(500)
         self._reload_model_timer.timeout.connect(self.pipeline.load_models_async)
+
+        self._mobile_port_timer = QTimer(self)
+        self._mobile_port_timer.setSingleShot(True)
+        self._mobile_port_timer.setInterval(450)
+        self._mobile_port_timer.timeout.connect(self._apply_mobile_sync_settings)
+
+        self.mobile_server = MobileCompanionServer(
+            cfg_mgr=self.cfg_mgr,
+            stress_dict=self.stress_dict,
+            voice_mgr=self.voice_mgr,
+            pipeline=self.pipeline,
+            on_stress_changed=lambda act, w, r: self.mobile_stress_synced.emit(act, w, r),
+            on_character_changed=lambda act, n, g, sp: self.mobile_character_synced.emit(act, n, g, sp),
+            on_client_activity=lambda ip, cnt, ts: self.mobile_client_activity.emit(ip, cnt, ts),
+        )
 
         self.setWindowTitle("GTA VI SubVoice — Нейронная озвучка")
         self.setWindowIcon(build_app_icon(active=False))
@@ -369,6 +396,8 @@ class MainWindow(QMainWindow):
         if not self._startup_update_checked:
             self._startup_update_checked = True
             self._update_timer.start()
+        if self.cfg_mgr.config.mobile_sync_enabled:
+            self._apply_mobile_sync_settings()
 
     def _show_loading_banner(self, text: str) -> None:
         self.lbl_boot_status.setText(text)
@@ -841,6 +870,122 @@ class MainWindow(QMainWindow):
         mg_lay.addLayout(threads_row)
         layout.addWidget(model_group)
 
+        # 1b. Связь со смартфоном по локальному Wi-Fi (быстрые правки ударений, слово-замен и персонажей)
+        mobile_group = QGroupBox("Связь со смартфоном в одной Wi-Fi сети (ударения и персонажи)")
+        mob_lay = QVBoxLayout(mobile_group)
+        mob_lay.setSpacing(8)
+
+        mob_top = QHBoxLayout()
+        mob_top.setSpacing(8)
+        self.chk_mobile_sync = ViceToggleSwitch(
+            "Включить веб-пульт для смартфона по Wi-Fi",
+            accent="mint",
+        )
+        self.lbl_mobile_status = QLabel("Выключен")
+        self.lbl_mobile_status.setStyleSheet("color: #9A96B0; font-size: 11px; font-weight: 700;")
+        mob_top.addWidget(self.chk_mobile_sync, 1)
+        mob_top.addWidget(self.lbl_mobile_status)
+        mob_lay.addLayout(mob_top)
+
+        self.mobile_details_box = QWidget()
+        md_lay = QHBoxLayout(self.mobile_details_box)
+        md_lay.setContentsMargins(0, 2, 0, 0)
+        md_lay.setSpacing(12)
+
+        # Слева: чёткий QR-код на белой подложке для быстрого сканирования камерой
+        qr_col = QVBoxLayout()
+        qr_col.setSpacing(4)
+        self.lbl_mobile_qr = QLabel()
+        self.lbl_mobile_qr.setFixedSize(164, 164)
+        self.lbl_mobile_qr.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_mobile_qr.setStyleSheet("background: #FFFFFF; border-radius: 10px; padding: 4px;")
+        qr_cap = QLabel("Сканируйте камерой")
+        qr_cap.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        qr_cap.setStyleSheet("color: #9A96B0; font-size: 10px;")
+        qr_col.addWidget(self.lbl_mobile_qr)
+        qr_col.addWidget(qr_cap)
+        qr_col.addStretch(1)
+        md_lay.addLayout(qr_col)
+
+        # Справа: сеть, порт, код доступа, URL и кнопки управления
+        info_col = QVBoxLayout()
+        info_col.setSpacing(6)
+
+        net_row = QHBoxLayout()
+        net_row.setSpacing(6)
+        net_row.addWidget(QLabel("IP:"))
+        self.combo_mobile_ip = QComboBox()
+        self.combo_mobile_ip.setMinimumHeight(26)
+        self.btn_mobile_refresh_ip = QPushButton()
+        self.btn_mobile_refresh_ip.setIcon(svg_icon("refresh-cw", "#E3DFF7", 13))
+        self.btn_mobile_refresh_ip.setIconSize(QSize(13, 13))
+        self.btn_mobile_refresh_ip.setToolTip("Обновить список сетевых адресов Wi-Fi / LAN")
+        net_row.addWidget(self.combo_mobile_ip, 1)
+        net_row.addWidget(self.btn_mobile_refresh_ip)
+        net_row.addWidget(QLabel("Порт:"))
+        self.spin_mobile_port = QSpinBox()
+        self.spin_mobile_port.setRange(1024, 65535)
+        self.spin_mobile_port.setMinimumWidth(72)
+        net_row.addWidget(self.spin_mobile_port)
+        info_col.addLayout(net_row)
+
+        tok_row = QHBoxLayout()
+        tok_row.setSpacing(6)
+        tok_row.addWidget(QLabel("Код доступа:"))
+        self.lbl_mobile_token = QLabel("—")
+        self.lbl_mobile_token.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.lbl_mobile_token.setStyleSheet(
+            "color: #00E5C3; font-weight: 800; font-size: 12px; letter-spacing: 1px;"
+        )
+        self.btn_mobile_regen_token = QPushButton(" Новый код")
+        self.btn_mobile_regen_token.setIcon(svg_icon("refresh-cw", "#E3DFF7", 12))
+        self.btn_mobile_regen_token.setIconSize(QSize(12, 12))
+        tok_row.addWidget(self.lbl_mobile_token)
+        tok_row.addStretch(1)
+        tok_row.addWidget(self.btn_mobile_regen_token)
+        info_col.addLayout(tok_row)
+
+        url_row = QHBoxLayout()
+        url_row.setSpacing(6)
+        self.edit_mobile_url = QLineEdit()
+        self.edit_mobile_url.setReadOnly(True)
+        self.btn_mobile_copy = QPushButton(" Копировать")
+        self.btn_mobile_copy.setIcon(svg_icon("copy", "#00D9B5", 12))
+        self.btn_mobile_copy.setIconSize(QSize(12, 12))
+        url_row.addWidget(self.edit_mobile_url, 1)
+        url_row.addWidget(self.btn_mobile_copy)
+        info_col.addLayout(url_row)
+
+        act_row = QHBoxLayout()
+        act_row.setSpacing(6)
+        self.btn_mobile_open = QPushButton(" Открыть в браузере")
+        self.btn_mobile_open.setIcon(svg_icon("external-link", "#E3DFF7", 12))
+        self.btn_mobile_open.setIconSize(QSize(12, 12))
+        self.btn_mobile_firewall = QPushButton(" Разрешить порт в Firewall")
+        self.btn_mobile_firewall.setIcon(svg_icon("shield-check", "#00D9B5", 12))
+        self.btn_mobile_firewall.setIconSize(QSize(12, 12))
+        self.btn_mobile_firewall.setToolTip("Добавить правило для порта в брандмауэр Windows, если телефон не открывает ссылку")
+        act_row.addWidget(self.btn_mobile_open)
+        act_row.addWidget(self.btn_mobile_firewall)
+        act_row.addStretch(1)
+        info_col.addLayout(act_row)
+
+        mob_hint = QLabel(
+            "Телефон и ПК должны быть в одной Wi-Fi сети. Правки ударений, слово-замен, пола и голоса применяются сразу без перезапуска."
+        )
+        mob_hint.setWordWrap(True)
+        mob_hint.setStyleSheet("color: #9A96B0; font-size: 11px;")
+        info_col.addWidget(mob_hint)
+
+        self.lbl_mobile_peer = QLabel("Подключения по сети: 0 (ожидание телефона)")
+        self.lbl_mobile_peer.setStyleSheet("color: #B4AFC9; font-size: 11px;")
+        info_col.addWidget(self.lbl_mobile_peer)
+
+        md_lay.addLayout(info_col, 1)
+        mob_lay.addWidget(self.mobile_details_box)
+        self.mobile_details_box.setVisible(False)
+        layout.addWidget(mobile_group)
+
         # 2. Автоприглушение звука и отслеживание активности целевого окна
         duck_group = QGroupBox("Приглушение звука и фильтр активности окна")
         df = QFormLayout(duck_group)
@@ -1105,6 +1250,19 @@ class MainWindow(QMainWindow):
         self.btn_manual_model.clicked.connect(self._on_manual_install_silero)
         self.btn_check_updates.clicked.connect(lambda: self._start_update_check(manual=True))
 
+        # Связь со смартфоном (Wi-Fi пульт)
+        self.chk_mobile_sync.toggled.connect(self._on_mobile_sync_toggled)
+        self.spin_mobile_port.valueChanged.connect(self._on_mobile_port_changed)
+        self.combo_mobile_ip.currentIndexChanged.connect(self._refresh_mobile_qr_and_url)
+        self.btn_mobile_refresh_ip.clicked.connect(self._populate_mobile_ips)
+        self.btn_mobile_regen_token.clicked.connect(self._on_mobile_regen_token)
+        self.btn_mobile_copy.clicked.connect(self._on_mobile_copy_url)
+        self.btn_mobile_open.clicked.connect(self._on_mobile_open_browser)
+        self.btn_mobile_firewall.clicked.connect(self._on_mobile_open_firewall)
+        self.mobile_stress_synced.connect(self._on_mobile_stress_synced)
+        self.mobile_character_synced.connect(self._on_mobile_character_synced)
+        self.mobile_client_activity.connect(self._on_mobile_client_activity)
+
         self.pipeline.status_changed.connect(self._on_status_changed)
         self.pipeline.loading_progress.connect(self._show_loading_banner)
         self.pipeline.log_event.connect(self._on_log_event)
@@ -1311,6 +1469,15 @@ class MainWindow(QMainWindow):
                 ed.blockSignals(True)
                 ed.setText(val)
                 ed.blockSignals(False)
+
+            self.chk_mobile_sync.blockSignals(True)
+            self.chk_mobile_sync.setChecked(cfg.mobile_sync_enabled)
+            self.chk_mobile_sync.blockSignals(False)
+            self.spin_mobile_port.blockSignals(True)
+            self.spin_mobile_port.setValue(cfg.mobile_sync_port)
+            self.spin_mobile_port.blockSignals(False)
+            self._populate_mobile_ips()
+            self._refresh_mobile_qr_and_url()
         finally:
             self._syncing_ui = False
 
@@ -1753,6 +1920,7 @@ class MainWindow(QMainWindow):
             self._refresh_components_table(verify_hash=False)
             self.pipeline.apply_config(new_cfg)
             self._register_hotkeys()
+            self._apply_mobile_sync_settings()
 
             if new_cfg.always_on_top != old_top:
                 was_vis = self.isVisible()
@@ -1792,6 +1960,7 @@ class MainWindow(QMainWindow):
         self.pipeline.apply_config(fresh)
         self._register_hotkeys()
         self._refresh_components_table(verify_hash=False)
+        self._apply_mobile_sync_settings()
 
         if fresh.always_on_top != old_top:
             was_vis = self.isVisible()
@@ -2046,6 +2215,180 @@ class MainWindow(QMainWindow):
         self.pipeline.text_filter.reset_dedup()
         self._refresh_stress_table()
 
+    # ------------------------------------------------------------------ Связь со смартфоном (Wi-Fi пульт)
+    def _populate_mobile_ips(self) -> None:
+        prev_ip = str(self.combo_mobile_ip.currentData() or "")
+        ips = detect_lan_ips()
+        self.combo_mobile_ip.blockSignals(True)
+        self.combo_mobile_ip.clear()
+        for idx, ip in enumerate(ips):
+            label = f"{ip} (основной Wi-Fi/LAN)" if idx == 0 else ip
+            self.combo_mobile_ip.addItem(label, ip)
+        if prev_ip:
+            p_idx = self.combo_mobile_ip.findData(prev_ip)
+            if p_idx >= 0:
+                self.combo_mobile_ip.setCurrentIndex(p_idx)
+        self.combo_mobile_ip.blockSignals(False)
+        self._refresh_mobile_qr_and_url()
+
+    def _refresh_mobile_qr_and_url(self) -> None:
+        cfg = self.cfg_mgr.config
+        if not cfg.mobile_sync_token:
+            cfg.mobile_sync_token = generate_access_token()
+            self._schedule_auto_save()
+        self.lbl_mobile_token.setText(cfg.mobile_sync_token)
+
+        running = self.mobile_server.is_running
+        self.mobile_details_box.setVisible(bool(cfg.mobile_sync_enabled or running))
+
+        if running:
+            port = self.mobile_server.bound_port
+            host = self.mobile_server.bound_host
+            self.lbl_mobile_status.setText(f"Онлайн ({host}:{port})")
+            self.lbl_mobile_status.setStyleSheet("color: #00E5C3; font-size: 11px; font-weight: 700;")
+            peer_ip, peer_ts, hits = self.mobile_server.last_peer_info
+            if hits > 0 and peer_ip:
+                self.lbl_mobile_peer.setText(f"Последнее подключение с телефона: {peer_ip} в {peer_ts} (запросов: {hits})")
+                self.lbl_mobile_peer.setStyleSheet("color: #00E5C3; font-size: 11px; font-weight: 600;")
+            else:
+                self.lbl_mobile_peer.setText(f"Сокет {host}:{port} слушает LAN • Подключений с телефона: 0")
+                self.lbl_mobile_peer.setStyleSheet("color: #B4AFC9; font-size: 11px;")
+        elif cfg.mobile_sync_enabled and self.mobile_server.last_error:
+            self.lbl_mobile_status.setText("Ошибка порта")
+            self.lbl_mobile_status.setStyleSheet("color: #FF4D6D; font-size: 11px; font-weight: 700;")
+            self.lbl_mobile_peer.setText(self.mobile_server.last_error)
+            self.lbl_mobile_peer.setStyleSheet("color: #FF4D6D; font-size: 11px;")
+        else:
+            self.lbl_mobile_status.setText("Выключен")
+            self.lbl_mobile_status.setStyleSheet("color: #9A96B0; font-size: 11px; font-weight: 700;")
+            self.lbl_mobile_peer.setText("Подключения по сети: сервер остановлен")
+            self.lbl_mobile_peer.setStyleSheet("color: #9A96B0; font-size: 11px;")
+
+        cur_ip = str(self.combo_mobile_ip.currentData() or detect_lan_ips()[0])
+        url = self.mobile_server.build_url(ip_address=cur_ip, include_token=True)
+        self.edit_mobile_url.setText(url)
+        try:
+            pm = render_qr_pixmap(url, target_px=152, quiet_modules=3)
+            self.lbl_mobile_qr.setPixmap(pm)
+        except Exception:
+            self.lbl_mobile_qr.setText("QR\nошибка")
+
+    def _on_mobile_sync_toggled(self, checked: bool) -> None:
+        if self._syncing_ui:
+            return
+        self.cfg_mgr.config.mobile_sync_enabled = bool(checked)
+        self._apply_mobile_sync_settings()
+
+    def _on_mobile_port_changed(self, value: int) -> None:
+        if self._syncing_ui:
+            return
+        self.cfg_mgr.config.mobile_sync_port = int(value)
+        self._schedule_auto_save()
+        if self.cfg_mgr.config.mobile_sync_enabled:
+            self._mobile_port_timer.start()
+        else:
+            self._refresh_mobile_qr_and_url()
+
+    def _apply_mobile_sync_settings(self) -> None:
+        cfg = self.cfg_mgr.config
+        if not cfg.mobile_sync_token:
+            cfg.mobile_sync_token = generate_access_token()
+
+        if not cfg.mobile_sync_enabled:
+            self.mobile_server.stop()
+            self._schedule_auto_save()
+            self._refresh_mobile_qr_and_url()
+            return
+
+        self._populate_mobile_ips()
+        ok, actual_port, err = self.mobile_server.start(
+            port=cfg.mobile_sync_port,
+            token=cfg.mobile_sync_token,
+            auto_fallback_port=True,
+        )
+        if ok:
+            if actual_port != cfg.mobile_sync_port:
+                cfg.mobile_sync_port = actual_port
+                self.spin_mobile_port.blockSignals(True)
+                self.spin_mobile_port.setValue(actual_port)
+                self.spin_mobile_port.blockSignals(False)
+            self._on_log_event(
+                PipelineLogEvent(
+                    "WIFI",
+                    "info",
+                    "—",
+                    cfg.ocr_engine,
+                    0.0,
+                    f"Веб-пульт Wi-Fi запущен: {self.mobile_server.build_url(str(self.combo_mobile_ip.currentData() or ''), include_token=False)}",
+                )
+            )
+        else:
+            self._on_log_event(
+                PipelineLogEvent("WIFI", "error", "—", cfg.ocr_engine, 0.0, err or "Не удалось запустить Wi-Fi пульт")
+            )
+            QMessageBox.warning(self, "Веб-пульт Wi-Fi", err or "Не удалось запустить локальный веб-сервер.")
+
+        self._schedule_auto_save()
+        self._refresh_mobile_qr_and_url()
+
+    def _on_mobile_regen_token(self) -> None:
+        cfg = self.cfg_mgr.config
+        cfg.mobile_sync_token = generate_access_token()
+        self.mobile_server.set_token(cfg.mobile_sync_token)
+        self._schedule_auto_save()
+        self._refresh_mobile_qr_and_url()
+
+    def _on_mobile_copy_url(self) -> None:
+        url = self.edit_mobile_url.text().strip()
+        if not url:
+            return
+        cb = QApplication.clipboard()
+        if cb is not None:
+            cb.setText(url)
+        self._on_log_event(
+            PipelineLogEvent("WIFI", "info", "—", self.cfg_mgr.config.ocr_engine, 0.0, "Ссылка Wi-Fi пульта скопирована в буфер обмена")
+        )
+
+    def _on_mobile_open_browser(self) -> None:
+        url = self.edit_mobile_url.text().strip()
+        if url:
+            webbrowser.open(url)
+
+    def _on_mobile_open_firewall(self) -> None:
+        port = self.mobile_server.bound_port or self.cfg_mgr.config.mobile_sync_port
+        ok, msg = open_firewall_port_windows(port)
+        if ok:
+            QMessageBox.information(self, "Брандмауэр Windows", msg)
+        else:
+            QMessageBox.warning(self, "Брандмауэр Windows", msg)
+
+    def _on_mobile_stress_synced(self, action: str, word: str, replacement: str) -> None:
+        self._refresh_stress_table()
+        msg = (
+            f"Удалено слово (Wi-Fi): «{word}»"
+            if action == "delete"
+            else f"Словарь (Wi-Fi): «{word}» → «{replacement}»"
+        )
+        self._on_log_event(PipelineLogEvent("WIFI", "info", "—", self.cfg_mgr.config.ocr_engine, 0.0, msg))
+
+    def _on_mobile_character_synced(self, action: str, name: str, gender: str, speaker: str) -> None:
+        self._refresh_characters_table()
+        if action == "delete":
+            msg = f"Персонаж удалён (Wi-Fi): {name}"
+        else:
+            g_lbl = "Ж" if gender == "female" else "М"
+            sp_lbl = speaker_display_name(speaker, short=True)
+            msg = f"Персонаж (Wi-Fi): {name} → {g_lbl}, {sp_lbl}"
+        self._on_log_event(PipelineLogEvent("WIFI", "info", "—", self.cfg_mgr.config.ocr_engine, 0.0, msg))
+
+    def _on_mobile_client_activity(self, ip: str, hits: int, ts: str) -> None:
+        if hits == 1:
+            self._on_log_event(
+                PipelineLogEvent("WIFI", "info", "—", self.cfg_mgr.config.ocr_engine, 0.0, f"Подключилось устройство по Wi-Fi: {ip}")
+            )
+        self.lbl_mobile_peer.setText(f"Последнее подключение с телефона: {ip} в {ts} (запросов: {hits})")
+        self.lbl_mobile_peer.setStyleSheet("color: #00E5C3; font-size: 11px; font-weight: 600;")
+
     # ------------------------------------------------------------------ События конвейера
     def _on_status_changed(self, state_code: str, label: str) -> None:
         color = STATE_COLORS.get(state_code, "#9A96B0")
@@ -2195,11 +2538,15 @@ class MainWindow(QMainWindow):
                 self.cfg_mgr.save()
         except Exception:
             pass
-        for tm in (self._reload_model_timer, self._ram_timer, self._update_timer):
+        for tm in (self._reload_model_timer, self._ram_timer, self._update_timer, self._mobile_port_timer):
             try:
                 tm.stop()
             except Exception:
                 pass
+        try:
+            self.mobile_server.stop()
+        except Exception:
+            pass
         if self._update_check_thread is not None and self._update_check_thread.isRunning():
             try:
                 self._update_check_thread.wait(800)

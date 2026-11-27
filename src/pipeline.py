@@ -168,6 +168,41 @@ class SubtitlePipeline(QObject):
         self._recent_overlaps: collections.deque[float] = collections.deque(maxlen=8)
         self._status_audio_cache: dict[str, np.ndarray] = {}
 
+        # Лёгкая потокобезопасная история последних реплик для быстрого редактирования со смартфона по Wi-Fi
+        self._mobile_history_lock = threading.Lock()
+        self._mobile_event_seq: int = 0
+        self._recent_mobile_history: collections.deque[dict] = collections.deque(maxlen=30)
+
+    def _record_mobile_utterance(
+        self,
+        *,
+        speaker_name: str,
+        gender: str,
+        voice: str,
+        raw_text: str,
+        tts_text: str,
+    ) -> None:
+        """Сохраняет недавно озвученную фразу для отображения в мобильном веб-пульте."""
+        with self._mobile_history_lock:
+            self._mobile_event_seq += 1
+            entry = {
+                "id": self._mobile_event_seq,
+                "ts": time.strftime("%H:%M:%S"),
+                "speaker": speaker_name,
+                "gender": gender if gender in ("male", "female") else "male",
+                "voice": voice,
+                "voice_label": speaker_display_name(voice, short=True),
+                "raw_text": raw_text,
+                "tts_text": tts_text,
+            }
+            self._recent_mobile_history.appendleft(entry)
+
+    def get_recent_utterances(self, limit: int = 20) -> list[dict]:
+        """Возвращает последние озвученные реплики (новейшие первыми)."""
+        with self._mobile_history_lock:
+            items = list(self._recent_mobile_history)
+        return items[: max(1, int(limit))]
+
     @property
     def is_running(self) -> bool:
         return self._running
@@ -727,7 +762,7 @@ class SubtitlePipeline(QObject):
         speech_text = self.punctuator.restore(utt.raw_speech)
         speaker_display = utt.speaker_name or "Диктор"
 
-        speaker_id, _gender, created = self.voice_manager.resolve_speaker(
+        speaker_id, detected_gender, created = self.voice_manager.resolve_speaker(
             speaker_name=utt.speaker_name,
             voice_mode=self.config.voice_mode,
             single_speaker=self.config.single_speaker,
@@ -833,6 +868,15 @@ class SubtitlePipeline(QObject):
             else:
                 self.player.enqueue_chunk(processed)
                 sent_payloads.append(chunk_payload)
+
+        if spoken_first:
+            self._record_mobile_utterance(
+                speaker_name=utt.speaker_name or "",
+                gender=detected_gender,
+                voice=speaker_id,
+                raw_text=speech_text,
+                tts_text=" || ".join(sent_payloads) if sent_payloads else speech_text,
+            )
 
         if spoken_first and self.debug_logger.enabled:
             self.debug_logger.record_spoken(

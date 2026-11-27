@@ -149,6 +149,16 @@ _SVG_PATHS: dict[str, str] = {
         '<path d="M12 9v4"/>'
         '<path d="M12 17h.01"/>'
     ),
+    "smartphone": (
+        '<rect width="14" height="20" x="5" y="2" rx="2" ry="2"/>'
+        '<path d="M12 18h.01"/>'
+    ),
+    "wifi": (
+        '<path d="M12 20h.01"/>'
+        '<path d="M2 8.82a15 15 0 0 1 20 0"/>'
+        '<path d="M5 12.859a10 10 0 0 1 14 0"/>'
+        '<path d="M8.5 16.429a5 5 0 0 1 7 0"/>'
+    ),
 }
 
 _ICON_CACHE: dict[tuple[str, str, int, float], QIcon] = {}
