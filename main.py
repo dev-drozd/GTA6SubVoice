@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 
 import psutil
@@ -158,6 +159,7 @@ def main() -> int:
     parser.add_argument("--smoke-out", type=str, default=None)
     parser.add_argument("--check-ui-modes", action="store_true")
     parser.add_argument("--skip-system-check", action="store_true")
+    parser.add_argument("--after-update", action="store_true")
     args, _unknown = parser.parse_known_args()
 
     if args.smoke_test:
@@ -215,7 +217,8 @@ def main() -> int:
     instance_guard = None
     if not args.check_ui_modes:
         instance_guard = SingleInstanceGuard("GTA6SubVoice_SingleInstance_v1")
-        if not instance_guard.acquire():
+        wait_ms = 5000 if args.after_update else 0
+        if not instance_guard.acquire(wait_timeout_ms=wait_ms):
             return 0
 
     cfg_mgr = ConfigManager()
@@ -259,10 +262,16 @@ def main() -> int:
         QTimer.singleShot(25, window.start_bootstrap)
 
     rc = app.exec()
-    hotkey_mgr.unregister_all()
-    pipeline.shutdown()
+    # Освобождаем single-instance mutex и IPC-канал до останова фоновых потоков,
+    # чтобы перезапуск и повторный запуск пользователя никогда не блокировались.
     if instance_guard is not None:
         instance_guard.release()
+    # Страховочный демон-таймер на случай блокировки C++ DLL (PyTorch/ONNX/PortAudio) в Py_FinalizeEx
+    exit_watchdog = threading.Timer(3.0, os._exit, args=(int(rc),))
+    exit_watchdog.daemon = True
+    exit_watchdog.start()
+    hotkey_mgr.unregister_all()
+    pipeline.shutdown()
     return rc
 
 

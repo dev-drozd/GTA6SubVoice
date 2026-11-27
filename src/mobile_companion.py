@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -17,8 +18,10 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import parse_qs, urlparse
 
+from src.audio_dsp import normalize_speed_preset
 from src.capture import set_current_thread_below_normal
 from src.config import ConfigManager
+from src.paths import DATA_DIR
 from src.pipeline import SubtitlePipeline
 from src.text_filter import StressDictManager
 from src.version import APP_VERSION
@@ -213,6 +216,9 @@ class MobileCompanionServer:
         on_stress_changed: Optional[Callable[[str, str, str], None]] = None,
         on_character_changed: Optional[Callable[[str, str, str, str], None]] = None,
         on_client_activity: Optional[Callable[[str, int, str], None]] = None,
+        on_report_saved: Optional[Callable[[str, str], None]] = None,
+        on_settings_changed: Optional[Callable[[dict[str, Any]], None]] = None,
+        report_log_path: Optional[Path] = None,
     ) -> None:
         self.cfg_mgr = cfg_mgr
         self.stress_dict = stress_dict
@@ -221,6 +227,10 @@ class MobileCompanionServer:
         self.on_stress_changed = on_stress_changed
         self.on_character_changed = on_character_changed
         self.on_client_activity = on_client_activity
+        self.on_report_saved = on_report_saved
+        self.on_settings_changed = on_settings_changed
+        self.report_log_path = report_log_path or (DATA_DIR / "debug_logs" / "saved_subtitles.txt")
+        self._report_lock = threading.Lock()
 
         self._lock = threading.Lock()
         self._httpd: Optional[_BoundThreadingHTTPServer] = None
@@ -444,11 +454,18 @@ class MobileCompanionServer:
         return {
             "ok": True,
             "version": APP_VERSION,
+            "session_id": getattr(self.pipeline, "mobile_session_id", ""),
             "pipeline_running": self.pipeline.is_running,
             "voice_mode": cfg.voice_mode,
             "dual_male_speaker": cfg.dual_male_speaker,
             "dual_female_speaker": cfg.dual_female_speaker,
             "single_speaker": cfg.single_speaker,
+            "speech_speed": normalize_speed_preset(cfg.speech_speed),
+            "adaptive_tempo": bool(cfg.adaptive_tempo),
+            "volume": int(cfg.volume),
+            "ducking_enabled": bool(cfg.ducking_enabled),
+            "mute_target_window": bool(cfg.mute_target_window),
+            "ducking_depth_pct": int(cfg.ducking_depth_pct),
             "speakers": speakers,
             "recent": recent,
             "characters": characters,
@@ -594,6 +611,102 @@ class MobileCompanionServer:
         self.pipeline.speak_test_async(text=text, speaker=speaker, label=label)
         return HTTPStatus.OK, {"ok": True}
 
+    def _handle_post_report(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """Сохраняет отмеченную пользователем на телефоне реплику в отдельный лог-файл для разбора проблем."""
+        raw_text = str(body.get("raw_text") or "").strip()[:1000]
+        tts_text = str(body.get("tts_text") or "").strip()[:1000]
+        if not raw_text and not tts_text:
+            return HTTPStatus.BAD_REQUEST, {"ok": False, "error": "Нет текста реплики для сохранения."}
+
+        speaker = str(body.get("speaker") or "").strip()[:80] or "Без имени"
+        gender = str(body.get("gender") or "").strip()[:16] or "—"
+        voice = str(body.get("voice") or "").strip()[:32] or "—"
+        voice_label = str(body.get("voice_label") or "").strip()[:48]
+        phrase_ts = str(body.get("ts") or "").strip()[:24] or "—"
+        note = str(body.get("note") or "").strip()[:300]
+
+        voice_desc = f"{voice_label} ({voice})" if voice_label and voice_label != voice else voice
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        lines = [
+            f"[{now_str}] Персонаж: {speaker} | Пол/Голос: {gender} / {voice_desc} | Время реплики: {phrase_ts}",
+            f"  Субтитр (raw): {raw_text or '—'}",
+        ]
+        if tts_text and tts_text != raw_text:
+            lines.append(f"  Озвучено (TTS): {tts_text}")
+        if note:
+            lines.append(f"  Заметка: {note}")
+        lines.append("")
+        block = "\n".join(lines) + "\n"
+
+        with self._report_lock:
+            self.report_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.report_log_path, "a", encoding="utf-8") as f:
+                f.write(block)
+
+        if self.on_report_saved is not None:
+            try:
+                self.on_report_saved(speaker, raw_text or tts_text)
+            except Exception:
+                pass
+        return HTTPStatus.OK, {"ok": True, "path": str(self.report_log_path)}
+
+    def _handle_post_settings(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """Обновляет настройки озвучки, темпа, громкости и приглушения игры со смартфона в реальном времени."""
+        cfg = self.cfg_mgr.config
+        if "voice_mode" in body:
+            vm = str(body.get("voice_mode") or "").strip()
+            if vm not in ("single", "dual_mj", "multi"):
+                return HTTPStatus.BAD_REQUEST, {"ok": False, "error": "Некорректный режим голосов."}
+            cfg.voice_mode = vm
+
+        for key in ("single_speaker", "dual_male_speaker", "dual_female_speaker"):
+            if key in body:
+                sp = str(body.get(key) or "").strip()
+                if sp not in ALL_SILERO_SPEAKERS:
+                    return HTTPStatus.BAD_REQUEST, {"ok": False, "error": f"Неизвестный голос: {sp}"}
+                setattr(cfg, key, sp)
+
+        if "adaptive_tempo" in body:
+            cfg.adaptive_tempo = bool(body.get("adaptive_tempo"))
+            if cfg.adaptive_tempo:
+                cfg.speech_speed = "medium"
+
+        if "speech_speed" in body and not cfg.adaptive_tempo:
+            cfg.speech_speed = normalize_speed_preset(body.get("speech_speed"))
+
+        if "volume" in body:
+            try:
+                vol = int(round(float(body.get("volume"))))
+            except Exception:
+                return HTTPStatus.BAD_REQUEST, {"ok": False, "error": "Некорректное значение громкости."}
+            cfg.volume = max(0, min(200, vol))
+
+        if "ducking_enabled" in body:
+            cfg.ducking_enabled = bool(body.get("ducking_enabled"))
+
+        if "mute_target_window" in body:
+            cfg.mute_target_window = bool(body.get("mute_target_window"))
+
+        self.cfg_mgr.save(cfg)
+        self.pipeline.apply_config(cfg)
+        if self.on_settings_changed is not None:
+            try:
+                self.on_settings_changed(cfg.to_dict())
+            except Exception:
+                pass
+        return HTTPStatus.OK, {
+            "ok": True,
+            "voice_mode": cfg.voice_mode,
+            "single_speaker": cfg.single_speaker,
+            "dual_male_speaker": cfg.dual_male_speaker,
+            "dual_female_speaker": cfg.dual_female_speaker,
+            "speech_speed": normalize_speed_preset(cfg.speech_speed),
+            "adaptive_tempo": bool(cfg.adaptive_tempo),
+            "volume": int(cfg.volume),
+            "ducking_enabled": bool(cfg.ducking_enabled),
+            "mute_target_window": bool(cfg.mute_target_window),
+        }
+
     def _make_handler_class(self) -> type[BaseHTTPRequestHandler]:
         owner = self
 
@@ -736,6 +849,12 @@ class MobileCompanionServer:
                 elif path == "/api/test":
                     st, res = owner._handle_post_test_speech(body)
                     self._send_json(st, res)
+                elif path == "/api/report":
+                    st, res = owner._handle_post_report(body)
+                    self._send_json(st, res)
+                elif path == "/api/settings":
+                    st, res = owner._handle_post_settings(body)
+                    self._send_json(st, res)
                 else:
                     self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "Маршрут не найден."})
 
@@ -799,6 +918,11 @@ _WEB_SVG_ICONS: dict[str, str] = {
     "radio": '<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16.247 7.761a6 6 0 0 1 0 8.478m2.828-11.306a10 10 0 0 1 0 14.134m-14.15 0a10 10 0 0 1 0-14.134m2.828 11.306a6 6 0 0 1 0-8.478"/><circle cx="12" cy="12" r="2"/></svg>',
     "book": '<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v16m8.001-2A2 2 0 0 0 22 17V5a2 2 0 0 0-1.999-2L16 3.002A5 5 0 0 0 12 5a5 5 0 0 0-4-2H4a2 2 0 0 0-2 2v12a2 2 0 0 0 1.999 2H8a5 5 0 0 1 4 2a5 5 0 0 1 4-2z"/></svg>',
     "users": '<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M16 3.128a4 4 0 0 1 0 7.744M22 21v-2a4 4 0 0 0-3-3.87"/><circle cx="9" cy="7" r="4"/></svg>',
+    "select": '<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 21h1M14 3h1m4 0a2 2 0 0 1 2 2m0 9v1m0 4a2 2 0 0 1-2 2m2-12v1M3 14v1m0-6v1m2 11a2 2 0 0 1-2-2M5 3a2 2 0 0 0-2 2m4 7h10M7 16h6M7 8h8M9 21h1M9 3h1"/></svg>',
+    "check": '<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>',
+    "bookmark": '<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2 2 0 0 1 2 2v15a1 1 0 0 1-1.496.868l-4.512-2.578a2 2 0 0 0-1.984 0l-4.512 2.578A1 1 0 0 1 5 20V5a2 2 0 0 1 2-2z"/></svg>',
+    "bookmark_check": '<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2 2 0 0 1 2 2v15a1 1 0 0 1-1.496.868l-4.512-2.578a2 2 0 0 0-1.984 0l-4.512 2.578A1 1 0 0 1 5 20V5a2 2 0 0 1 2-2z"/><path d="m9 10l2 2l4-4"/></svg>',
+    "sliders": '<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 5H3m9 14H3M14 3v4m2 10v4m5-9h-9m9 7h-5m5-14h-7m-6 5v4m0-2H3"/></svg>',
 }
 
 
@@ -815,6 +939,9 @@ def _render_mobile_app_html(initial_token: str) -> str:
     ico_male = _WEB_SVG_ICONS["male"]
     ico_female = _WEB_SVG_ICONS["female"]
     ico_x = _WEB_SVG_ICONS["x"]
+    ico_select = _WEB_SVG_ICONS["select"]
+    ico_check = _WEB_SVG_ICONS["check"]
+    ico_sliders = _WEB_SVG_ICONS["sliders"]
     return f"""<!doctype html>
 <html lang="ru">
 <head>
@@ -858,12 +985,12 @@ def _render_mobile_app_html(initial_token: str) -> str:
   .dot.off {{ background: var(--orange); }}
   .dot.err {{ background: var(--danger); }}
   .tabs {{
-    display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-top: 10px;
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px; margin-top: 10px;
   }}
   .tab-btn {{
     border: 1px solid var(--border); background: var(--card); color: var(--muted);
-    border-radius: 10px; padding: 9px 6px; font-size: 13px; font-weight: 700; cursor: pointer;
-    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+    border-radius: 10px; padding: 9px 4px; font-size: 12px; font-weight: 700; cursor: pointer;
+    display: inline-flex; align-items: center; justify-content: center; gap: 4px; white-space: nowrap;
   }}
   .ico {{ width: 15px; height: 15px; flex-shrink: 0; display: inline-block; vertical-align: middle; }}
   .tab-btn.active {{
@@ -906,6 +1033,37 @@ def _render_mobile_app_html(initial_token: str) -> str:
     display: flex; align-items: center; justify-content: space-between; gap: 8px;
     margin-bottom: 8px; flex-wrap: wrap;
   }}
+  .card-actions {{ display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }}
+  .btn-saved {{ border-color: rgba(0, 217, 181, 0.55); background: rgba(0, 217, 181, 0.16); color: #8af7e3; }}
+  .sec-title {{
+    font-size: 13px; font-weight: 800; color: var(--mint); margin: 0 0 10px;
+    text-transform: uppercase; letter-spacing: 0.4px;
+  }}
+  .mode-grid {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }}
+  .mode-btn {{
+    min-height: 42px; padding: 6px 4px; border-radius: 10px; border: 1px solid var(--border);
+    background: #0e0d1d; color: var(--muted); font-size: 12px; font-weight: 700;
+    cursor: pointer; text-align: center; line-height: 1.2;
+  }}
+  .mode-btn.active {{
+    border-color: var(--pink); background: rgba(255, 91, 153, 0.22); color: #ffffff;
+  }}
+  .mode-btn:disabled {{ opacity: 0.45; cursor: not-allowed; }}
+  .dual-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }}
+  .ctrl-head {{ display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }}
+  .ctrl-val {{ font-size: 14px; font-weight: 800; color: var(--mint); }}
+  .ctrl-val.pink {{ color: var(--pink); }}
+  input[type="range"] {{
+    width: 100%; height: 34px; accent-color: var(--mint); cursor: pointer; background: transparent;
+  }}
+  .toggle-row {{
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    padding: 10px 0 2px; border-top: 1px solid rgba(44, 39, 77, 0.7); margin-top: 8px;
+    cursor: pointer;
+  }}
+  .toggle-row:first-of-type {{ margin-top: 6px; }}
+  .toggle-lbl {{ font-size: 14px; color: var(--text); font-weight: 600; line-height: 1.3; flex: 1; }}
+  .toggle-chk {{ width: 22px; height: 22px; accent-color: var(--mint); flex-shrink: 0; cursor: pointer; }}
   .speaker-badges {{ display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }}
   .badge {{
     font-size: 12px; font-weight: 700; padding: 3px 8px; border-radius: 999px;
@@ -918,8 +1076,34 @@ def _render_mobile_app_html(initial_token: str) -> str:
   .word-chip {{
     border: 1px solid #35305a; background: #1d1a36; color: #ffffff;
     border-radius: 9px; padding: 7px 10px; font-size: 15px; line-height: 1.2; cursor: pointer;
+    user-select: none; -webkit-user-select: none;
   }}
   .word-chip:active {{ transform: scale(0.97); border-color: var(--mint); }}
+  .word-chip.selected {{
+    border-color: var(--mint); background: rgba(0, 217, 181, 0.24); color: #ffffff;
+    box-shadow: 0 0 0 1px rgba(0, 217, 181, 0.35);
+  }}
+  .live-bar {{
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    margin-bottom: 10px; flex-wrap: wrap;
+  }}
+  .btn-toggle.active {{
+    border-color: var(--mint); background: rgba(0, 217, 181, 0.2); color: #8af7e3;
+  }}
+  #pane-live.has-dock {{ padding-bottom: 88px; }}
+  .selection-dock {{
+    position: fixed; left: 12px; right: 12px; bottom: calc(12px + env(safe-area-inset-bottom));
+    z-index: 40; max-width: 696px; margin: 0 auto;
+    background: #18162f; border: 1px solid var(--mint); border-radius: 14px;
+    padding: 10px 12px; box-shadow: 0 12px 30px rgba(0,0,0,0.58);
+    display: none; align-items: center; justify-content: space-between; gap: 10px;
+  }}
+  .selection-dock.open {{ display: flex; }}
+  .sel-text {{
+    min-width: 0; flex: 1; font-size: 14px; font-weight: 700; color: #ffffff;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }}
+  .sel-actions {{ display: flex; gap: 6px; flex-shrink: 0; }}
   .tts-line {{ font-size: 12px; color: var(--muted); word-break: break-word; }}
   .dict-row {{
     display: flex; align-items: center; justify-content: space-between; gap: 10px;
@@ -991,6 +1175,7 @@ def _render_mobile_app_html(initial_token: str) -> str:
   </div>
   <div class="tabs">
     <button class="tab-btn active" data-tab="live">{ico_radio}Эфир</button>
+    <button class="tab-btn" data-tab="control">{ico_sliders}Пульт</button>
     <button class="tab-btn" data-tab="stress">{ico_book}Ударения</button>
     <button class="tab-btn" data-tab="chars">{ico_users}Персонажи</button>
   </div>
@@ -998,9 +1183,75 @@ def _render_mobile_app_html(initial_token: str) -> str:
 
 <main>
   <section id="pane-live" class="pane active">
-    <div class="hint">Нажмите на <b>любое слово</b> в последней фразе, чтобы поправить ударение или замену, либо на кнопку <b>Пол / Голос</b> рядом с именем говорящего.</div>
+    <div class="hint" id="liveHint">Нажмите на <b>слово</b> для ударения. Включите <b>«Выбрать фразу»</b> (или удерживайте слово), чтобы выделить несколько слов сразу.</div>
+    <div class="live-bar">
+      <button type="button" class="btn btn-sm btn-toggle" id="btnTogglePhrase">{ico_select}Выбрать фразу</button>
+      <button type="button" class="btn btn-sm btn-danger" id="btnClearLive">{ico_trash}Очистить</button>
+    </div>
     <div id="liveModeWarn" class="warn-banner" style="display:none;"></div>
     <div id="liveList"><div class="empty">Ожидаем озвученные субтитры из игры…</div></div>
+  </section>
+
+  <section id="pane-control" class="pane">
+    <div class="card">
+      <div class="sec-title">Озвучка (Silero v5.6)</div>
+      <div class="mode-grid">
+        <button type="button" class="mode-btn" data-vmode="single">1 голос</button>
+        <button type="button" class="mode-btn" data-vmode="dual_mj">2 голоса (М/Ж)</button>
+        <button type="button" class="mode-btn" data-vmode="multi">Многоголосый</button>
+      </div>
+      <div id="ctrlSinglePanel" style="margin-top:10px; display:none;">
+        <label class="field-lbl" for="selSingleVoice">Диктор</label>
+        <select id="selSingleVoice"></select>
+      </div>
+      <div id="ctrlDualPanel" class="dual-grid" style="display:none;">
+        <div>
+          <label class="field-lbl" for="selDualMale">Мужской (М:)</label>
+          <select id="selDualMale"></select>
+        </div>
+        <div>
+          <label class="field-lbl" for="selDualFemale">Женский (Ж:)</label>
+          <select id="selDualFemale"></select>
+        </div>
+      </div>
+      <div id="ctrlMultiHint" class="hint" style="margin:10px 0 0; display:none;">
+        До 5 нейронных голосов Silero 5.6 (Евгений и Ксения — приоритет)
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="sec-title">Темп речи</div>
+      <div class="ctrl-head">
+        <span style="font-size:14px; font-weight:600;">Текущий темп:</span>
+        <span class="ctrl-val pink" id="lblCtrlSpeed">Обычный (1.0x)</span>
+      </div>
+      <div class="mode-grid">
+        <button type="button" class="mode-btn" data-speed="medium">Обычный (1.0x)</button>
+        <button type="button" class="mode-btn" data-speed="fast">Быстрый (1.2x)</button>
+        <button type="button" class="mode-btn" data-speed="x-fast">Очень быстрый (1.5x)</button>
+      </div>
+      <label class="toggle-row" for="chkCtrlAdaptive">
+        <span class="toggle-lbl">Автоускорение темпа</span>
+        <input type="checkbox" class="toggle-chk" id="chkCtrlAdaptive">
+      </label>
+    </div>
+
+    <div class="card">
+      <div class="sec-title">Громкость и звук приложения</div>
+      <div class="ctrl-head">
+        <span style="font-size:14px; font-weight:600;">Громкость диктора:</span>
+        <span class="ctrl-val" id="lblCtrlVol">100%</span>
+      </div>
+      <input type="range" id="rngCtrlVol" min="0" max="200" step="5" value="100">
+      <label class="toggle-row" for="chkCtrlDucking">
+        <span class="toggle-lbl">Приглушать звук игры во время речи (Auto-Ducking)</span>
+        <input type="checkbox" class="toggle-chk" id="chkCtrlDucking">
+      </label>
+      <label class="toggle-row" for="chkCtrlMute">
+        <span class="toggle-lbl">Отключать звук окна, пока идёт чтение</span>
+        <input type="checkbox" class="toggle-chk" id="chkCtrlMute">
+      </label>
+    </div>
   </section>
 
   <section id="pane-stress" class="pane">
@@ -1068,19 +1319,37 @@ def _render_mobile_app_html(initial_token: str) -> str:
   </div>
 </div>
 
+<div class="selection-dock" id="selectionDock">
+  <div class="sel-text" id="selPreview"></div>
+  <div class="sel-actions">
+    <button type="button" class="btn btn-sm" id="btnCancelSel">{ico_x}Сброс</button>
+    <button type="button" class="btn btn-sm btn-primary" id="btnApplySel">{ico_check}В словарь</button>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
 const TOKEN = {safe_tok_json};
 const ICONS = {safe_icons_json};
 const VOWELS = new Set(["а","е","ё","и","о","у","ы","э","ю","я","А","Е","Ё","И","О","У","Ы","Э","Ю","Я"]);
-let STATE = {{ speakers: [], recent: [], characters: [], stress: [], voice_mode: "dual_mj" }};
+const MAX_LOCAL_LIVE = 20;
+const LS_LIVE_KEY = "gta6subvoice_live_cache_v1";
+let STATE = {{ session_id: "", speakers: [], recent: [], characters: [], stress: [], voice_mode: "dual_mj" }};
+let LAST_SERVER_RECENT = [];
 let activeTab = "live";
 let editingOldWord = "";
 let selectedCharGender = "male";
 let selectedCharSpeaker = "eugene";
 let editingCharLocked = false;
 let toastTimer = null;
+let phraseMode = false;
+let selectedCardKey = "";
+let selectedIndices = new Set();
+let selectedCardParts = [];
+const savedReportKeys = new Set();
+let isDraggingVolume = false;
+let volumeDebounceTimer = null;
 
 function showToast(msg, isErr = false) {{
   const el = document.getElementById("toast");
@@ -1128,6 +1397,120 @@ function cleanTokenWord(raw) {{
   return raw.replace(/^[«»"'(\\[{{]+|[»"'.,!?;:)\\]}}…]+$/g, "").trim();
 }}
 
+function cleanSelectedPhrase(parts, indicesSet) {{
+  const sorted = Array.from(indicesSet).sort((a, b) => a - b);
+  if (sorted.length === 0) return "";
+  if (sorted.length === 1) {{
+    const p = parts[sorted[0]] || "";
+    return cleanTokenWord(p) || p;
+  }}
+  const raw = sorted.map(i => parts[i] || "").filter(Boolean).join(" ");
+  const trimmed = raw.replace(/^[«»"'(\\[{{]+|[»"'.,!?;:)\\]}}…]+$/g, "").trim();
+  return trimmed || raw.trim();
+}}
+
+function readLiveCache() {{
+  try {{
+    const raw = localStorage.getItem(LS_LIVE_KEY);
+    if (!raw) return {{ session_id: "", cleared_after_id: 0, items: [] }};
+    const obj = JSON.parse(raw);
+    return {{
+      session_id: String(obj.session_id || ""),
+      cleared_after_id: Number(obj.cleared_after_id || 0),
+      items: Array.isArray(obj.items) ? obj.items.slice(0, MAX_LOCAL_LIVE) : [],
+    }};
+  }} catch (e) {{
+    return {{ session_id: "", cleared_after_id: 0, items: [] }};
+  }}
+}}
+
+function writeLiveCache(cache) {{
+  try {{
+    localStorage.setItem(LS_LIVE_KEY, JSON.stringify({{
+      session_id: String(cache.session_id || ""),
+      cleared_after_id: Number(cache.cleared_after_id || 0),
+      items: (cache.items || []).slice(0, MAX_LOCAL_LIVE),
+    }}));
+  }} catch (e) {{}}
+}}
+
+function syncLiveWithStorage(serverSessionId, serverRecent) {{
+  const sid = String(serverSessionId || "");
+  const srv = Array.isArray(serverRecent) ? serverRecent : [];
+  LAST_SERVER_RECENT = srv;
+  const cache = readLiveCache();
+  let clearedId = cache.cleared_after_id;
+  if (sid && cache.session_id && cache.session_id !== sid) {{
+    clearedId = 0;
+  }}
+  const mapByUid = new Map();
+  const merged = [];
+  for (const it of srv) {{
+    const itemId = Number(it.id || 0);
+    if (itemId <= clearedId) continue;
+    const uid = sid ? (sid + ":" + itemId) : ("s:" + itemId + ":" + (it.ts || "") + ":" + (it.raw_text || ""));
+    if (!mapByUid.has(uid)) {{
+      const copy = Object.assign({{}}, it, {{ _uid: uid }});
+      mapByUid.set(uid, copy);
+      merged.push(copy);
+    }}
+  }}
+  for (const old of cache.items) {{
+    const uid = String(old._uid || ("legacy:" + (old.id || 0) + ":" + (old.ts || "") + ":" + (old.raw_text || "")));
+    if (sid && old._uid && old._uid.startsWith(sid + ":") && Number(old.id || 0) <= clearedId) continue;
+    if (!mapByUid.has(uid)) {{
+      const copy = Object.assign({{}}, old, {{ _uid: uid }});
+      mapByUid.set(uid, copy);
+      merged.push(copy);
+    }}
+  }}
+  const bounded = merged.slice(0, MAX_LOCAL_LIVE);
+  writeLiveCache({{
+    session_id: sid || cache.session_id,
+    cleared_after_id: clearedId,
+    items: bounded,
+  }});
+  return bounded;
+}}
+
+function setPhraseMode(enabled) {{
+  phraseMode = Boolean(enabled);
+  const btn = document.getElementById("btnTogglePhrase");
+  btn.classList.toggle("active", phraseMode);
+  const hint = document.getElementById("liveHint");
+  if (phraseMode) {{
+    hint.innerHTML = "Режим фразы включён: <b>отметьте несколько слов</b> в нужной реплике и нажмите <b>«В словарь»</b> снизу.";
+  }} else {{
+    hint.innerHTML = "Нажмите на <b>слово</b> для ударения. Включите <b>«Выбрать фразу»</b> (или удерживайте слово), чтобы выделить несколько слов сразу.";
+  }}
+  if (!phraseMode) {{
+    clearWordSelection(false);
+  }}
+}}
+
+function updateSelectionDock() {{
+  const dock = document.getElementById("selectionDock");
+  const pane = document.getElementById("pane-live");
+  const preview = document.getElementById("selPreview");
+  const phrase = cleanSelectedPhrase(selectedCardParts, selectedIndices);
+  if (selectedIndices.size > 0 && phrase) {{
+    preview.textContent = "«" + phrase + "» (" + selectedIndices.size + ")";
+    dock.classList.add("open");
+    pane.classList.add("has-dock");
+  }} else {{
+    dock.classList.remove("open");
+    pane.classList.remove("has-dock");
+  }}
+}}
+
+function clearWordSelection(rerender = true) {{
+  selectedCardKey = "";
+  selectedIndices = new Set();
+  selectedCardParts = [];
+  updateSelectionDock();
+  if (rerender) renderLive();
+}}
+
 function setBtnIconLabel(btn, iconName, text) {{
   btn.innerHTML = (ICONS[iconName] || "") + (text ? ("<span>" + text + "</span>") : "");
 }}
@@ -1141,9 +1524,12 @@ function renderLive() {{
     empty.className = "empty";
     empty.textContent = "Пока нет озвученных фраз. Как только в игре пойдут субтитры, они появятся здесь в реальном времени.";
     box.appendChild(empty);
+    updateSelectionDock();
     return;
   }}
+  let foundSelectedCard = false;
   for (const item of STATE.recent) {{
+    const cardKey = String(item._uid || item.id || (item.ts + ":" + item.raw_text));
     const card = document.createElement("div");
     card.className = "card";
 
@@ -1169,6 +1555,42 @@ function renderLive() {{
 
     head.appendChild(badges);
 
+    const actions = document.createElement("div");
+    actions.className = "card-actions";
+
+    const isSavedLog = savedReportKeys.has(cardKey);
+    const saveLogBtn = document.createElement("button");
+    saveLogBtn.type = "button";
+    saveLogBtn.className = "btn btn-sm" + (isSavedLog ? " btn-saved" : "");
+    setBtnIconLabel(saveLogBtn, isSavedLog ? "bookmark_check" : "bookmark", isSavedLog ? "В логе" : "В лог");
+    saveLogBtn.addEventListener("click", async () => {{
+      saveLogBtn.disabled = true;
+      try {{
+        await apiFetch("/api/report", {{
+          method: "POST",
+          body: JSON.stringify({{
+            id: item.id || 0,
+            ts: item.ts || "",
+            speaker: item.speaker || "",
+            gender: item.gender || "",
+            voice: item.voice || "",
+            voice_label: item.voice_label || "",
+            raw_text: item.raw_text || "",
+            tts_text: item.tts_text || "",
+          }}),
+        }});
+        savedReportKeys.add(cardKey);
+        saveLogBtn.classList.add("btn-saved");
+        setBtnIconLabel(saveLogBtn, "bookmark_check", "В логе");
+        showToast("Реплика сохранена в лог на ПК");
+      }} catch (e) {{
+        showToast(e.message, true);
+      }} finally {{
+        saveLogBtn.disabled = false;
+      }}
+    }});
+    actions.appendChild(saveLogBtn);
+
     const editCharBtn = document.createElement("button");
     editCharBtn.className = "btn btn-sm btn-accent";
     setBtnIconLabel(editCharBtn, item.speaker ? "pencil" : "plus", item.speaker ? "Пол / Голос" : "Персонаж");
@@ -1180,19 +1602,66 @@ function renderLive() {{
         openCharModal(item.speaker || "", item.gender || "male", item.voice || "eugene", true);
       }}
     }});
-    head.appendChild(editCharBtn);
+    actions.appendChild(editCharBtn);
+    head.appendChild(actions);
     card.appendChild(head);
 
     const wordsWrap = document.createElement("div");
     wordsWrap.className = "word-flow";
     const parts = String(item.raw_text || "").split(/\\s+/).filter(Boolean);
-    for (const part of parts) {{
+    if (cardKey === selectedCardKey) {{
+      foundSelectedCard = true;
+      selectedCardParts = parts;
+    }}
+    parts.forEach((part, idx) => {{
       const clean = cleanTokenWord(part);
       const chip = document.createElement("button");
       chip.type = "button";
-      chip.className = "word-chip";
+      const isSel = (cardKey === selectedCardKey && selectedIndices.has(idx));
+      chip.className = "word-chip" + (isSel ? " selected" : "");
       chip.textContent = part;
+
+      let pressTimer = null;
+      let didLongPress = false;
+      const toggleSelectIdx = () => {{
+        if (selectedCardKey !== cardKey) {{
+          selectedCardKey = cardKey;
+          selectedIndices = new Set([idx]);
+          selectedCardParts = parts;
+        }} else {{
+          if (selectedIndices.has(idx)) selectedIndices.delete(idx);
+          else selectedIndices.add(idx);
+          if (selectedIndices.size === 0) {{
+            selectedCardKey = "";
+            selectedCardParts = [];
+          }}
+        }}
+        renderLive();
+      }};
+
+      chip.addEventListener("pointerdown", () => {{
+        didLongPress = false;
+        clearTimeout(pressTimer);
+        pressTimer = setTimeout(() => {{
+          didLongPress = true;
+          if (!phraseMode) setPhraseMode(true);
+          toggleSelectIdx();
+        }}, 380);
+      }});
+      const cancelPress = () => clearTimeout(pressTimer);
+      chip.addEventListener("pointerup", cancelPress);
+      chip.addEventListener("pointercancel", cancelPress);
+      chip.addEventListener("pointermove", cancelPress);
+
       chip.addEventListener("click", () => {{
+        if (didLongPress) {{
+          didLongPress = false;
+          return;
+        }}
+        if (phraseMode || selectedIndices.size > 0) {{
+          toggleSelectIdx();
+          return;
+        }}
         const targetWord = clean || part;
         const found = STATE.stress.find(s => s.word.toLowerCase() === targetWord.toLowerCase());
         if (found) {{
@@ -1202,17 +1671,24 @@ function renderLive() {{
         }}
       }});
       wordsWrap.appendChild(chip);
-    }}
+    }});
     card.appendChild(wordsWrap);
 
-    if (item.tts_text && item.tts_text !== item.raw_text) {{
+    const sileroPayload = String(item.tts_text || item.raw_text || "").trim();
+    if (sileroPayload) {{
       const tts = document.createElement("div");
       tts.className = "tts-line";
-      tts.textContent = "Озвучено как: " + item.tts_text;
+      tts.textContent = "В Silero: " + sileroPayload;
       card.appendChild(tts);
     }}
     box.appendChild(card);
   }}
+  if (selectedCardKey && !foundSelectedCard) {{
+    selectedCardKey = "";
+    selectedIndices = new Set();
+    selectedCardParts = [];
+  }}
+  updateSelectionDock();
 }}
 
 function renderStress() {{
@@ -1396,16 +1872,19 @@ function renderVowelHelper() {{
     btn.textContent = ch === " " ? "␣" : ch;
     btn.addEventListener("click", () => {{
       if (!VOWELS.has(ch)) return;
-      // Переставляем '+' перед выбранной гласной внутри этого слова/сегмента
-      const withoutPlus = [];
-      let targetPos = 0;
+      // Переставляем или снимаем '+' строго внутри текущего слова (по пробелам), не задевая соседние слова фразы
+      let wordStart = idx;
+      while (wordStart > 0 && chars[wordStart - 1] !== " ") wordStart--;
+      let wordEnd = idx;
+      while (wordEnd + 1 < chars.length && chars[wordEnd + 1] !== " ") wordEnd++;
+
+      const nextChars = [];
       for (let i = 0; i < chars.length; i++) {{
-        if (chars[i] === "+") continue;
-        if (i === idx) targetPos = withoutPlus.length;
-        withoutPlus.push(chars[i]);
+        if (i >= wordStart && i <= wordEnd && chars[i] === "+") continue;
+        if (i === idx && !prevWasPlus) nextChars.push("+");
+        nextChars.push(chars[i]);
       }}
-      withoutPlus.splice(targetPos, 0, "+");
-      document.getElementById("inpStressRepl").value = withoutPlus.join("");
+      document.getElementById("inpStressRepl").value = nextChars.join("");
       renderVowelHelper();
     }});
     box.appendChild(btn);
@@ -1479,20 +1958,200 @@ async function testSpeech(text, speaker, label) {{
   }}
 }}
 
+function speedPresetLabel(preset) {{
+  if (preset === "fast") return "Быстрый (1.2x)";
+  if (preset === "x-fast") return "Очень быстрый (1.5x)";
+  return "Обычный (1.0x)";
+}}
+
+function fillVoiceSelect(selectEl, speakers, preferredGender, selectedId) {{
+  const sorted = [...speakers].sort((a, b) => {{
+    if (!preferredGender) return 0;
+    const am = a.gender === preferredGender ? 0 : 1;
+    const bm = b.gender === preferredGender ? 0 : 1;
+    return am - bm;
+  }});
+  const curOpts = Array.from(selectEl.options).map(o => o.value).join(",");
+  const nextOpts = sorted.map(s => s.id).join(",");
+  if (curOpts !== nextOpts) {{
+    selectEl.textContent = "";
+    for (const sp of sorted) {{
+      const opt = document.createElement("option");
+      opt.value = sp.id;
+      opt.textContent = preferredGender ? sp.label : sp.full_label;
+      selectEl.appendChild(opt);
+    }}
+  }}
+  if (selectedId) selectEl.value = selectedId;
+}}
+
+function renderControl() {{
+  const mode = STATE.voice_mode || "dual_mj";
+  document.querySelectorAll("[data-vmode]").forEach(b => {{
+    b.classList.toggle("active", b.dataset.vmode === mode);
+  }});
+  document.getElementById("ctrlSinglePanel").style.display = mode === "single" ? "block" : "none";
+  document.getElementById("ctrlDualPanel").style.display = mode === "dual_mj" ? "grid" : "none";
+  document.getElementById("ctrlMultiHint").style.display = mode === "multi" ? "block" : "none";
+
+  const speakers = Array.isArray(STATE.speakers) ? STATE.speakers : [];
+  if (speakers.length > 0) {{
+    fillVoiceSelect(document.getElementById("selSingleVoice"), speakers, "", STATE.single_speaker || "eugene");
+    fillVoiceSelect(document.getElementById("selDualMale"), speakers, "male", STATE.dual_male_speaker || "eugene");
+    fillVoiceSelect(document.getElementById("selDualFemale"), speakers, "female", STATE.dual_female_speaker || "kseniya");
+  }}
+
+  const adaptive = Boolean(STATE.adaptive_tempo);
+  const preset = adaptive ? "medium" : (STATE.speech_speed || "medium");
+  document.getElementById("chkCtrlAdaptive").checked = adaptive;
+  document.getElementById("lblCtrlSpeed").textContent = adaptive
+    ? "Авто (medium → fast)"
+    : speedPresetLabel(preset);
+  document.querySelectorAll("[data-speed]").forEach(b => {{
+    b.disabled = adaptive;
+    b.classList.toggle("active", b.dataset.speed === preset);
+  }});
+
+  if (!isDraggingVolume) {{
+    const vol = Number(STATE.volume != null ? STATE.volume : 100);
+    document.getElementById("rngCtrlVol").value = String(vol);
+    document.getElementById("lblCtrlVol").textContent = vol + "%";
+  }}
+  document.getElementById("chkCtrlDucking").checked = Boolean(STATE.ducking_enabled);
+  document.getElementById("chkCtrlMute").checked = Boolean(STATE.mute_target_window);
+}}
+
+async function postSettings(patch, toastMsg = "") {{
+  try {{
+    const res = await apiFetch("/api/settings", {{
+      method: "POST",
+      body: JSON.stringify(patch),
+    }});
+    Object.assign(STATE, res);
+    setConnStatus(true, "ПК онлайн • " + modeLabel(STATE.voice_mode));
+    renderControl();
+    renderLive();
+    if (toastMsg) showToast(toastMsg);
+  }} catch (e) {{
+    showToast(e.message, true);
+  }}
+}}
+
 async function loadState() {{
   try {{
     const data = await apiFetch("/api/state");
     STATE = data;
+    STATE.recent = syncLiveWithStorage(data.session_id, data.recent);
     setConnStatus(true, "ПК онлайн • " + modeLabel(data.voice_mode));
     renderLive();
+    renderControl();
     renderStress();
     renderChars();
   }} catch (e) {{
+    if (!STATE.recent || STATE.recent.length === 0) {{
+      STATE.recent = readLiveCache().items;
+      renderLive();
+    }}
     setConnStatus(false, "Нет связи с ПК");
   }}
 }}
 
+// Привязка UI-событий пульта управления (режим дикторов, темп, громкость и приглушение)
+document.querySelectorAll("[data-vmode]").forEach(btn => {{
+  btn.addEventListener("click", () => {{
+    const vm = btn.dataset.vmode;
+    postSettings({{ voice_mode: vm }}, "Режим: " + modeLabel(vm));
+  }});
+}});
+document.getElementById("selSingleVoice").addEventListener("change", (e) => {{
+  postSettings({{ single_speaker: e.target.value }}, "Диктор обновлён");
+}});
+document.getElementById("selDualMale").addEventListener("change", (e) => {{
+  postSettings({{ dual_male_speaker: e.target.value }}, "Мужской голос обновлён");
+}});
+document.getElementById("selDualFemale").addEventListener("change", (e) => {{
+  postSettings({{ dual_female_speaker: e.target.value }}, "Женский голос обновлён");
+}});
+document.querySelectorAll("[data-speed]").forEach(btn => {{
+  btn.addEventListener("click", () => {{
+    if (document.getElementById("chkCtrlAdaptive").checked) return;
+    const sp = btn.dataset.speed;
+    postSettings({{ speech_speed: sp }}, "Темп: " + speedPresetLabel(sp));
+  }});
+}});
+document.getElementById("chkCtrlAdaptive").addEventListener("change", (e) => {{
+  const on = Boolean(e.target.checked);
+  postSettings({{ adaptive_tempo: on }}, on ? "Автоускорение включено" : "Автоускорение выключено");
+}});
+const rngVolEl = document.getElementById("rngCtrlVol");
+rngVolEl.addEventListener("pointerdown", () => {{ isDraggingVolume = true; }});
+rngVolEl.addEventListener("pointerup", () => {{ isDraggingVolume = false; }});
+rngVolEl.addEventListener("pointercancel", () => {{ isDraggingVolume = false; }});
+rngVolEl.addEventListener("input", (e) => {{
+  const v = Number(e.target.value);
+  document.getElementById("lblCtrlVol").textContent = v + "%";
+  clearTimeout(volumeDebounceTimer);
+  volumeDebounceTimer = setTimeout(() => {{
+    postSettings({{ volume: v }});
+  }}, 120);
+}});
+rngVolEl.addEventListener("change", (e) => {{
+  isDraggingVolume = false;
+  clearTimeout(volumeDebounceTimer);
+  postSettings({{ volume: Number(e.target.value) }});
+}});
+document.getElementById("chkCtrlDucking").addEventListener("change", (e) => {{
+  const on = Boolean(e.target.checked);
+  postSettings({{ ducking_enabled: on }}, on ? "Приглушение игры включено" : "Приглушение игры выключено");
+}});
+document.getElementById("chkCtrlMute").addEventListener("change", (e) => {{
+  const on = Boolean(e.target.checked);
+  postSettings({{ mute_target_window: on }}, on ? "Отключение звука окна включено" : "Звук окна не отключается");
+}});
+
 // Привязка UI-событий
+document.getElementById("btnTogglePhrase").addEventListener("click", () => {{
+  setPhraseMode(!phraseMode);
+}});
+
+document.getElementById("btnClearLive").addEventListener("click", () => {{
+  const cache = readLiveCache();
+  const sid = String(STATE.session_id || cache.session_id || "");
+  let maxId = Number(cache.cleared_after_id || 0);
+  for (const it of LAST_SERVER_RECENT) {{
+    const n = Number(it.id || 0);
+    if (n > maxId) maxId = n;
+  }}
+  for (const it of (STATE.recent || [])) {{
+    if (!sid || !it._uid || String(it._uid).startsWith(sid + ":")) {{
+      const n = Number(it.id || 0);
+      if (n > maxId) maxId = n;
+    }}
+  }}
+  writeLiveCache({{ session_id: sid, cleared_after_id: maxId, items: [] }});
+  STATE.recent = [];
+  clearWordSelection(false);
+  renderLive();
+  showToast("Лента эфира очищена");
+}});
+
+document.getElementById("btnCancelSel").addEventListener("click", () => {{
+  setPhraseMode(false);
+  clearWordSelection(true);
+}});
+
+document.getElementById("btnApplySel").addEventListener("click", () => {{
+  const phrase = cleanSelectedPhrase(selectedCardParts, selectedIndices);
+  if (!phrase) return;
+  const found = STATE.stress.find(s => s.word.toLowerCase() === phrase.toLowerCase());
+  setPhraseMode(false);
+  clearWordSelection(true);
+  if (found) {{
+    openStressModal(found.word, found.replacement, found.word);
+  }} else {{
+    openStressModal(phrase, phrase, "");
+  }}
+}});
 document.querySelectorAll(".tab-btn").forEach(btn => {{
   btn.addEventListener("click", () => {{
     activeTab = btn.dataset.tab;
@@ -1592,11 +2251,13 @@ document.getElementById("btnSaveChar").addEventListener("click", async () => {{
   }} catch (e) {{ showToast(e.message, true); }}
 }});
 
+STATE.recent = readLiveCache().items;
+renderLive();
 loadState();
 setInterval(() => {{
   const anyModal = document.getElementById("stressModal").classList.contains("open")
     || document.getElementById("charModal").classList.contains("open");
-  if (!anyModal && activeTab === "live") {{
+  if (!anyModal && selectedIndices.size === 0 && !isDraggingVolume && (activeTab === "live" || activeTab === "control")) {{
     loadState();
   }}
 }}, 1800);

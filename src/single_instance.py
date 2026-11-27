@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import sys
+import time
 from typing import Optional
 
 from PySide6.QtCore import QObject, Signal
@@ -43,11 +44,8 @@ class SingleInstanceGuard(QObject):
             sock.disconnectFromServer()
         return True
 
-    def acquire(self) -> bool:
-        """Пытается стать основным экземпляром приложения.
-        Возвращает True, если блокировка получена, или False, если копия уже запущена
-        (предварительно отправив сигнал на активацию существующего окна).
-        """
+    def _try_acquire_once(self, notify_existing: bool) -> bool:
+        """Одна попытка занять системный mutex и локальный IPC-сервер."""
         # 1. Атомарный системный mutex в Windows исключает гонки при одновременном запуске
         if sys.platform == "win32":
             try:
@@ -57,24 +55,33 @@ class SingleInstanceGuard(QObject):
                 if handle:
                     self._mutex_handle = int(handle)
                 if last_err == _ERROR_ALREADY_EXISTS:
-                    self._try_notify_existing()
+                    if notify_existing:
+                        self._try_notify_existing()
                     self.release()
                     return False
             except Exception:
                 pass
 
         # 2. Проверяем активный IPC-сервер (работает и в Windows, и в macOS)
-        if self._try_notify_existing():
-            self.release()
-            return False
+        if notify_existing:
+            if self._try_notify_existing():
+                self.release()
+                return False
+        else:
+            sock = QLocalSocket()
+            sock.connectToServer(self.app_id)
+            if sock.waitForConnected(120):
+                sock.disconnectFromServer()
+                self.release()
+                return False
 
         # 3. Очищаем устаревший сокет после аварийного завершения и поднимаем основной IPC-сервер
         QLocalServer.removeServer(self.app_id)
         server = QLocalServer(self)
         server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
         if not server.listen(self.app_id):
-            # Другой процесс успел занять listen() раньше
-            self._try_notify_existing()
+            if notify_existing:
+                self._try_notify_existing()
             self.release()
             return False
 
@@ -82,6 +89,18 @@ class SingleInstanceGuard(QObject):
         self._server = server
         self._is_primary = True
         return True
+
+    def acquire(self, wait_timeout_ms: int = 0) -> bool:
+        """Пытается стать основным экземпляром приложения.
+        При wait_timeout_ms > 0 (например, при перезапуске после обновления)
+        ждёт освобождения блокировки старым процессом без его повторной активации.
+        """
+        deadline = time.monotonic() + max(0, int(wait_timeout_ms)) / 1000.0
+        while wait_timeout_ms > 0 and time.monotonic() < deadline:
+            if self._try_acquire_once(notify_existing=False):
+                return True
+            time.sleep(0.15)
+        return self._try_acquire_once(notify_existing=True)
 
     def _on_new_connection(self) -> None:
         if self._server is None:

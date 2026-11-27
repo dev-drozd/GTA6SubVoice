@@ -105,6 +105,8 @@ _KNOWN_RU_ABBREVIATIONS = {
 }
 
 GARBAGE_LINE_PREFIX_RE = re.compile(r"^(?:[A-Za-z0-9\[\]\(\)\|]{1,3}\s+)+(?=[А-ЯЁ][а-яё])")
+# Прилипшие 1–3 заглавные буквы HUD-значка перед именем с заглавной+строчной («РАЭлонсо» -> «Элонсо»)
+_LEADING_UPPER_GLUE_RE = re.compile(r"^[А-ЯЁA-Z]{1,3}(?=[А-ЯЁA-Z][а-яёa-z]{2,})")
 # Поддерживает составные имена говорящих, где 2-е/3-е слово начинается со строчной («Местный житель:», «Офицер полиции:»)
 INLINE_NEXT_SPEAKER_RE = re.compile(
     r"(?<=[.!?…])\s+([А-ЯЁA-Z][а-яёa-z]{1,18}(?:\s+[А-ЯЁа-яёA-Za-z]{2,18}){0,2}):\s+"
@@ -475,6 +477,9 @@ def normalize_ocr_text(text: str) -> str:
     cleaned = re.sub(r"([А-ЯЁа-яёA-Za-z0-9,:;!?])«", r"\1 «", cleaned)
     cleaned = re.sub(r"»([А-ЯЁа-яёA-Za-z0-9])", r"» \1", cleaned)
     cleaned = DUP_COMMA_RE.sub(",", cleaned)
+    if cleaned.count('"') % 2 == 1:
+        cleaned = re.sub(r'([А-ЯЁа-яёA-Za-z])\.["\'](?=[А-ЯЁа-яёA-Za-z])', r"\1... ", cleaned)
+        cleaned = re.sub(r'(?<=[А-ЯЁа-яёA-Za-z.,!?…])"(?=[А-ЯЁа-яёA-Za-z])', " ", cleaned)
     cleaned = re.sub(r"\s+([,.:;!?…])", r"\1", cleaned)
     cleaned = MULTI_SPACE_RE.sub(" ", cleaned)
     return cleaned.strip()
@@ -1277,6 +1282,18 @@ def _normalize_speaker_case(name: str) -> str:
     return name
 
 
+def _clean_ocr_speaker_name(raw_candidate: str) -> str:
+    """Очищает имя говорящего от гомоглифов и прилипшего слева КАПС-мусора HUD (например 'РАЭлонсо' -> 'Элонсо')."""
+    fixed = _fix_ocr_name_homoglyphs(clean_character_name(raw_candidate))
+    fixed = _LEADING_UPPER_GLUE_RE.sub("", fixed).strip()
+    return _normalize_speaker_case(fixed)
+
+
+def _strip_leading_speech_punct(speech: str) -> str:
+    """Удаляет мусорные ведущие разделители вроде ': Так, ну...' после двоеточия говорящего."""
+    return re.sub(r"^[\s:;•·]+", "", speech).strip()
+
+
 def _extract_speaker_with_flag(text: str) -> tuple[Optional[str], str, bool]:
     """Внутренний помощник, возвращающий (имя_говорящего_или_None, чистая_речь, был_ли_префикс_говорящего).
     Гарантирует, что обрезанные OCR-префиксы вроде 'райан: Привет', 'ян: Эй!', 'естный житель: Паскуда!'
@@ -1295,8 +1312,8 @@ def _extract_speaker_with_flag(text: str) -> tuple[Optional[str], str, bool]:
         # 1. Стандартный формат 'Имя с заглавной: реплика' (до 4 слов / 39 символов, например, 'Сотрудник береговой охраны:')
         m = SPEAKER_PATTERN.match(cand)
         if m:
-            raw_left = _normalize_speaker_case(_fix_ocr_name_homoglyphs(clean_character_name(m.group(1))))
-            speech = strip_bracketed_annotations(m.group(2))
+            raw_left = _clean_ocr_speaker_name(m.group(1))
+            speech = _strip_leading_speech_punct(strip_bracketed_annotations(m.group(2)))
             words = raw_left.split()
             if words and words[0].lower() not in _NON_SPEAKER_COLON_WORDS and len(words) <= 4:
                 if is_valid_character_name(raw_left):
@@ -1310,7 +1327,7 @@ def _extract_speaker_with_flag(text: str) -> tuple[Optional[str], str, bool]:
         if mf:
             raw_left = _fix_ocr_name_homoglyphs(clean_character_name(mf.group(1)))
             sep = mf.group(2)
-            speech = strip_bracketed_annotations(mf.group(3))
+            speech = _strip_leading_speech_punct(strip_bracketed_annotations(mf.group(3)))
             words = raw_left.split()
             if not raw_left or not speech or len(words) > 4:
                 continue
@@ -1318,10 +1335,11 @@ def _extract_speaker_with_flag(text: str) -> tuple[Optional[str], str, bool]:
             if raw_left.isdigit() or (words[0].lower() in _NON_SPEAKER_COLON_WORDS):
                 continue
             if sep == ";":
-                if raw_left[0].isupper() and is_valid_character_name(raw_left) and (
+                norm_left = _clean_ocr_speaker_name(raw_left)
+                if raw_left[0].isupper() and is_valid_character_name(norm_left) and (
                     speech[0].isupper() or speech[0] in ("-", "—", "«", '"')
                 ):
-                    return _normalize_speaker_case(raw_left), speech, True
+                    return norm_left, speech, True
                 # Обрезанное имя говорящего со строчной перед ';', за которым следует реплика с заглавной ('райан; Привет!')
                 if not raw_left[0].isupper() and len(words) <= 3 and len(raw_left) <= 28 and speech[0].isupper():
                     return None, speech, True
@@ -1331,7 +1349,7 @@ def _extract_speaker_with_flag(text: str) -> tuple[Optional[str], str, bool]:
                     if len(words) <= 3 and len(raw_left) <= 28:
                         return None, speech, True
 
-    return None, strip_bracketed_annotations(sanitized), False
+    return None, _strip_leading_speech_punct(strip_bracketed_annotations(sanitized)), False
 
 
 def _split_inline_speakers(line: str) -> list[str]:
@@ -1463,22 +1481,46 @@ def _extract_dangling_speaker_prefix(line: str) -> tuple[Optional[str], bool]:
     return None, False
 
 
-def parse_subtitle_utterances(lines: list[str]) -> list[tuple[Optional[str], str, str]]:
-    """Разбирает упорядоченные сверху вниз визуальные строки OCR в последовательность реплик."""
-    expanded_lines: list[str] = []
-    for raw in lines:
+def parse_subtitle_utterances_with_bboxes(
+    lines_with_bboxes: list[tuple[str, Optional[tuple[int, int, int, int]]]],
+    rejected_boxes: int = 0,
+) -> list[tuple[Optional[str], str, str]]:
+    """Разбирает упорядоченные сверху вниз визуальные строки OCR (с координатами bbox) в последовательность реплик.
+    Если между двумя строками вертикальный разрыв >= 0.9 высоты строки (пропущена средняя перекрытая строка),
+    никогда не приклеивает нижнюю строку к верхней реплике чужого говорящего.
+    """
+    expanded: list[tuple[str, bool]] = []
+    prev_bbox: Optional[tuple[int, int, int, int]] = None
+
+    for raw, bbox in lines_with_bboxes:
+        vertical_gap = False
+        if prev_bbox is not None and bbox is not None:
+            prev_h = max(12, int(prev_bbox[3] - prev_bbox[1]))
+            cur_h = max(12, int(bbox[3] - bbox[1]))
+            gap_y = int(bbox[1]) - int(prev_bbox[3])
+            if gap_y > max(prev_h, cur_h) * 0.90:
+                vertical_gap = True
+        if bbox is not None:
+            prev_bbox = bbox
+
         cleaned = strip_garbage_prefix(strip_bracketed_annotations(normalize_ocr_text(raw)))
         if not cleaned:
             continue
-        expanded_lines.extend(_split_inline_speakers(cleaned))
+        sub_parts = _split_inline_speakers(cleaned)
+        for idx, part in enumerate(sub_parts):
+            expanded.append((part, vertical_gap and idx == 0))
 
-    if not expanded_lines:
+    if not expanded:
         return []
 
     utterances: list[list] = []
     pending_speaker: Optional[str] = None
     pending_anon_prefix = False
-    for line in expanded_lines:
+    for line, has_vertical_gap in expanded:
+        if has_vertical_gap:
+            pending_speaker = None
+            pending_anon_prefix = False
+
         dangling_spk, is_dangling = _extract_dangling_speaker_prefix(line)
         if is_dangling:
             pending_speaker = dangling_spk
@@ -1505,6 +1547,12 @@ def parse_subtitle_utterances(lines: list[str]) -> list[tuple[Optional[str], str
             pending_speaker = None
             pending_anon_prefix = False
             utterances.append([None, line, line])
+        elif has_vertical_gap:
+            # Оторванная нижняя строка после вертикальной дыры: если прямо сейчас OCR отклонил промежуточную строку,
+            # ждём следующий кадр без помехи, чтобы прочитать новую реплику целиком с именем спикера
+            if rejected_boxes > 0 and utterances:
+                continue
+            utterances.append([None, line, line])
         elif utterances and not _is_standalone_ui_noise_line(line):
             utterances[-1][1] = f"{utterances[-1][1]} {line}".strip()
             utterances[-1][2] = f"{utterances[-1][2]} {line}".strip()
@@ -1512,6 +1560,11 @@ def parse_subtitle_utterances(lines: list[str]) -> list[tuple[Optional[str], str
             utterances.append([None, line, line])
 
     return [(u[0], u[1], u[2]) for u in utterances]
+
+
+def parse_subtitle_utterances(lines: list[str]) -> list[tuple[Optional[str], str, str]]:
+    """Разбирает упорядоченные сверху вниз визуальные строки OCR в последовательность реплик."""
+    return parse_subtitle_utterances_with_bboxes([(raw, None) for raw in lines], rejected_boxes=0)
 
 
 class SubtitleTextFilter:
@@ -1640,10 +1693,20 @@ class SubtitleTextFilter:
             age = now - ts
             if age > eff_ttl:
                 continue
-            # Разные известные говорящие могут вполне естественно произносить одинаковые короткие приветствия/ответы ('Привет!', 'Да!', 'Спасибо!')
+            # Разные известные говорящие могут естественно произносить одинаковые короткие приветствия/ответы ('Привет!', 'Да!').
+            # Но длинная фраза (>= 25 симв.) или похожее искажённое OCR имя ('РАЭлонсо' vs 'Элонсо') в пределах TTL — это явный дубль.
             different_known_speaker = bool(cur_spk and prev_spk and cur_spk != prev_spk)
             if different_known_speaker:
-                if is_short_phrase or age > 3.5:
+                similar_speaker = (
+                    cur_spk in prev_spk
+                    or prev_spk in cur_spk
+                    or float(fuzz.ratio(cur_spk, prev_spk)) >= 65.0
+                )
+                is_long_duplicate_candidate = len(key) >= 25 and age <= 12.0
+                if not similar_speaker and not is_long_duplicate_candidate:
+                    if is_short_phrase or age > 3.5:
+                        continue
+                elif len(key) < 25 and is_short_phrase:
                     continue
 
             ratio = float(fuzz.ratio(key, prev_key))

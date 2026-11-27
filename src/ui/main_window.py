@@ -42,7 +42,7 @@ from PySide6.QtWidgets import (
 
 from src.audio_dsp import PRESET_DISPLAY_LABELS, normalize_speed_preset
 from src.audio_player import list_output_devices
-from src.capture import bring_target_window_to_front, find_target_window_hwnd
+from src.capture import bring_target_window_to_front, ensure_target_window_windowed, find_target_window_hwnd
 from src.config import ConfigManager, RoiConfig, export_profile_bundle, load_profile_bundle
 from src.dependency_manager import DependencyManager
 from src.ducking import PRESET_GAME_PROCESSES, list_selectable_processes
@@ -278,6 +278,8 @@ class MainWindow(QMainWindow):
     mobile_stress_synced = Signal(str, str, str)
     mobile_character_synced = Signal(str, str, str, str)
     mobile_client_activity = Signal(str, int, str)
+    mobile_report_saved = Signal(str, str)
+    mobile_settings_synced = Signal()
 
     def __init__(
         self,
@@ -329,6 +331,8 @@ class MainWindow(QMainWindow):
             on_stress_changed=lambda act, w, r: self.mobile_stress_synced.emit(act, w, r),
             on_character_changed=lambda act, n, g, sp: self.mobile_character_synced.emit(act, n, g, sp),
             on_client_activity=lambda ip, cnt, ts: self.mobile_client_activity.emit(ip, cnt, ts),
+            on_report_saved=lambda sp, txt: self.mobile_report_saved.emit(sp, txt),
+            on_settings_changed=lambda _d: self.mobile_settings_synced.emit(),
         )
 
         self.setWindowTitle("GTA VI SubVoice — Нейронная озвучка")
@@ -435,7 +439,7 @@ class MainWindow(QMainWindow):
         brand.setStyleSheet("border: none; background: transparent; padding-bottom: 1px;")
         hb_layout.addWidget(brand, 0, Qt.AlignmentFlag.AlignVCenter)
 
-        self.status_badge = AnimatedStatusBadge("Загрузка...")
+        self.status_badge = AnimatedStatusBadge("Запуск...")
         hb_layout.addWidget(self.status_badge, 0, Qt.AlignmentFlag.AlignVCenter)
 
         hb_layout.addStretch()
@@ -1013,14 +1017,9 @@ class MainWindow(QMainWindow):
         layout.addWidget(duck_group)
 
         # 3. Область захвата (ROI) и распознавание текста (OCR)
-        ocr_group = QGroupBox("Захват ROI и OCR")
+        ocr_group = QGroupBox("Захват ROI и OCR (RapidOCR)")
         form = QFormLayout(ocr_group)
         form.setSpacing(6)
-
-        self.combo_ocr = QComboBox()
-        self.combo_ocr.addItem("RapidOCR (ONNX PP-OCRv5 Кириллица)", "rapidocr")
-        self.combo_ocr.addItem("Windows OCR (WinRT, ультранизкая RAM)", "winrt")
-        form.addRow("Движок OCR:", self.combo_ocr)
 
         self.spin_fps = QSpinBox()
         self.spin_fps.setRange(2, 30)
@@ -1227,7 +1226,6 @@ class MainWindow(QMainWindow):
             self.combo_target_proc.lineEdit().editingFinished.connect(self._on_target_process_changed)
         self.spin_duck_depth.valueChanged.connect(self._on_settings_auto_changed)
         self.chk_only_when_active.toggled.connect(self._on_settings_auto_changed)
-        self.combo_ocr.currentIndexChanged.connect(self._on_settings_auto_changed)
         self.spin_fps.valueChanged.connect(self._on_settings_auto_changed)
         self.spin_debounce.valueChanged.connect(self._on_settings_auto_changed)
         self.spin_caps.valueChanged.connect(self._on_settings_auto_changed)
@@ -1262,6 +1260,8 @@ class MainWindow(QMainWindow):
         self.mobile_stress_synced.connect(self._on_mobile_stress_synced)
         self.mobile_character_synced.connect(self._on_mobile_character_synced)
         self.mobile_client_activity.connect(self._on_mobile_client_activity)
+        self.mobile_report_saved.connect(self._on_mobile_report_saved)
+        self.mobile_settings_synced.connect(self._on_mobile_settings_synced)
 
         self.pipeline.status_changed.connect(self._on_status_changed)
         self.pipeline.loading_progress.connect(self._show_loading_banner)
@@ -1446,12 +1446,6 @@ class MainWindow(QMainWindow):
             self.spin_duck_depth.setValue(cfg.ducking_depth_pct)
             self.spin_duck_depth.blockSignals(False)
 
-            self.combo_ocr.blockSignals(True)
-            ocr_idx = self.combo_ocr.findData(cfg.ocr_engine)
-            if ocr_idx >= 0:
-                self.combo_ocr.setCurrentIndex(ocr_idx)
-            self.combo_ocr.blockSignals(False)
-
             for spin, val in (
                 (self.spin_fps, cfg.scan_fps),
                 (self.spin_debounce, cfg.debounce_ms),
@@ -1532,6 +1526,18 @@ class MainWindow(QMainWindow):
                 return
             if self.cfg_mgr.config.target_process != target_proc:
                 self._on_target_process_changed()
+            _found_win, exited_fs = ensure_target_window_windowed(target_proc)
+            if exited_fs:
+                self._on_log_event(
+                    PipelineLogEvent(
+                        "WIN",
+                        "info",
+                        "—",
+                        self.cfg_mgr.config.ocr_engine,
+                        0.0,
+                        f"Окно «{target_proc}» переведено в оконный режим",
+                    )
+                )
 
         running = self.pipeline.toggle_start_stop()
         if running:
@@ -1598,7 +1604,22 @@ class MainWindow(QMainWindow):
             self._restore_window_after_roi()
             return
 
+        _found_fs, exited_fs = ensure_target_window_windowed(target_proc)
+        if exited_fs:
+            self._on_log_event(
+                PipelineLogEvent(
+                    "WIN",
+                    "info",
+                    "—",
+                    self.cfg_mgr.config.ocr_engine,
+                    0.0,
+                    f"Окно «{target_proc}» переведено в оконный режим",
+                )
+            )
+
         delay_ms = 0 if already_fg else (240 if was_minimized else 110)
+        if exited_fs:
+            delay_ms = max(delay_ms, 280)
         if delay_ms > 0:
             QTimer.singleShot(delay_ms, self._launch_roi_overlay)
         else:
@@ -1807,7 +1828,6 @@ class MainWindow(QMainWindow):
         cfg = self.cfg_mgr.config
         old_model = cfg.silero_model_path
         old_threads = cfg.torch_num_threads
-        old_ocr = cfg.ocr_engine
         old_hotkeys = (cfg.hotkeys.toggle_pause, cfg.hotkeys.select_roi, cfg.hotkeys.interrupt)
 
         cfg.silero_model_path = to_portable_path(self.edit_model_path.text().strip())
@@ -1815,7 +1835,7 @@ class MainWindow(QMainWindow):
         cfg.ducking_depth_pct = self.spin_duck_depth.value()
         cfg.only_when_target_active = self.chk_only_when_active.isChecked()
 
-        cfg.ocr_engine = str(self.combo_ocr.currentData() or "rapidocr")
+        cfg.ocr_engine = "rapidocr"
         cfg.scan_fps = self.spin_fps.value()
         cfg.debounce_ms = self.spin_debounce.value()
         cfg.caps_ratio_threshold = round(self.spin_caps.value(), 2)
@@ -1844,9 +1864,6 @@ class MainWindow(QMainWindow):
         new_hotkeys = (cfg.hotkeys.toggle_pause, cfg.hotkeys.select_roi, cfg.hotkeys.interrupt)
         if new_hotkeys != old_hotkeys:
             self._register_hotkeys()
-
-        if cfg.ocr_engine != old_ocr:
-            self._refresh_components_table(verify_hash=False)
 
         if cfg.silero_model_path != old_model or cfg.torch_num_threads != old_threads:
             self._reload_model_timer.start()
@@ -2389,6 +2406,23 @@ class MainWindow(QMainWindow):
         self.lbl_mobile_peer.setText(f"Последнее подключение с телефона: {ip} в {ts} (запросов: {hits})")
         self.lbl_mobile_peer.setStyleSheet("color: #00E5C3; font-size: 11px; font-weight: 600;")
 
+    def _on_mobile_report_saved(self, speaker: str, raw_text: str) -> None:
+        short = raw_text[:60] + ("…" if len(raw_text) > 60 else "")
+        sp = speaker or "Без имени"
+        self._on_log_event(
+            PipelineLogEvent(
+                "WIFI",
+                "info",
+                sp,
+                self.cfg_mgr.config.ocr_engine,
+                0.0,
+                f"Реплика сохранена с телефона в saved_subtitles.txt: {short}",
+            )
+        )
+
+    def _on_mobile_settings_synced(self) -> None:
+        self._sync_ui_from_config()
+
     # ------------------------------------------------------------------ События конвейера
     def _on_status_changed(self, state_code: str, label: str) -> None:
         color = STATE_COLORS.get(state_code, "#9A96B0")
@@ -2490,10 +2524,17 @@ class MainWindow(QMainWindow):
             self.lbl_update_status.setText("Проверяю наличие обновлений на GitHub...")
             self.lbl_update_status.setStyleSheet("color: #9A96B0; font-size: 11px;")
 
-        th = UpdateCheckThread(manual=manual, parent=self)
+        th = UpdateCheckThread(manual=manual, parent=None)
         th.checked.connect(self._on_update_check_done)
+        th.finished.connect(th.deleteLater)
+        th.finished.connect(self._on_update_thread_finished)
         self._update_check_thread = th
         th.start()
+
+    def _on_update_thread_finished(self) -> None:
+        sender_obj = self.sender()
+        if sender_obj is not None and sender_obj is self._update_check_thread:
+            self._update_check_thread = None
 
     def _on_update_check_done(self, release_obj: object, err_msg: str, manual: bool) -> None:
         self.btn_check_updates.setEnabled(True)
@@ -2533,6 +2574,10 @@ class MainWindow(QMainWindow):
             return
         self._did_shutdown = True
         try:
+            self.pipeline.request_shutdown()
+        except Exception:
+            pass
+        try:
             if self._save_timer.isActive():
                 self._save_timer.stop()
                 self.cfg_mgr.save()
@@ -2547,11 +2592,18 @@ class MainWindow(QMainWindow):
             self.mobile_server.stop()
         except Exception:
             pass
-        if self._update_check_thread is not None and self._update_check_thread.isRunning():
+        th = self._update_check_thread
+        self._update_check_thread = None
+        if th is not None:
             try:
-                self._update_check_thread.wait(800)
+                th.checked.disconnect(self._on_update_check_done)
             except Exception:
                 pass
+            if th.isRunning():
+                try:
+                    th.wait(300)
+                except Exception:
+                    pass
         if self._roi_overlay is not None:
             try:
                 self._roi_overlay.close()
@@ -2585,10 +2637,36 @@ class MainWindow(QMainWindow):
 
     def quit_application(self) -> None:
         self._force_quit = True
-        # Немедленно выполняем полное завершение, чтобы выход из скрытого трея никогда не игнорировался
-        self._perform_clean_shutdown()
-        if self.isVisible():
-            self.close()
+        # Мгновенно скрываем окно, ROI-оверлей и иконку в трее до остановки фоновых потоков,
+        # чтобы Windows не показывал «зависшее» полупрозрачное окно при выходе и обновлении.
+        if self._roi_overlay is not None:
+            try:
+                self._roi_overlay.hide()
+            except Exception:
+                pass
+        try:
+            if self.isVisible():
+                self.hide()
+        except Exception:
+            pass
+        try:
+            self.tray.hide()
+        except Exception:
+            pass
         app = QApplication.instance()
+        if app is not None:
+            # Закрываем открытые дочерние диалоги (включая UpdateDialog), чтобы не держали event loop
+            for w in list(app.topLevelWidgets()):
+                if w is not self:
+                    try:
+                        w.close()
+                    except Exception:
+                        pass
+            app.processEvents()
+        self._perform_clean_shutdown()
+        try:
+            self.close()
+        except Exception:
+            pass
         if app is not None:
             app.quit()

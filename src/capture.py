@@ -29,11 +29,18 @@ _PID_NAME_CACHE_LOCK = threading.Lock()
 _PID_NAME_CACHE: dict[int, tuple[float, str]] = {}
 
 _GW_HWNDPREV = 3
+_GWL_STYLE = -16
 _GWL_EXSTYLE = -20
+_WS_CAPTION = 0x00C00000
+_WS_THICKFRAME = 0x00040000
 _WS_EX_TOPMOST = 0x00000008
 _WS_EX_LAYERED = 0x00080000
 _WS_EX_TRANSPARENT = 0x00000020
 _WS_EX_TOOLWINDOW = 0x00000080
+_MONITOR_DEFAULTTONEAREST = 2
+_INPUT_KEYBOARD = 1
+_KEYEVENTF_KEYUP = 0x0002
+_VK_F11 = 0x7A
 _DWMWA_EXTENDED_FRAME_BOUNDS = 9
 _DWMWA_CLOAKED = 14
 _PW_CLIENTONLY = 0x00000001
@@ -82,6 +89,59 @@ class _BITMAPINFO(ctypes.Structure):
     _fields_ = [("bmiHeader", _BITMAPINFOHEADER), ("bmiColors", wintypes.DWORD * 3)]
 
 
+class _MONITORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", _RECT),
+        ("rcWork", _RECT),
+        ("dwFlags", wintypes.DWORD),
+    ]
+
+
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx", wintypes.LONG),
+        ("dy", wintypes.LONG),
+        ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+
+class _HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [
+        ("uMsg", wintypes.DWORD),
+        ("wParamL", wintypes.WORD),
+        ("wParamH", wintypes.WORD),
+    ]
+
+
+class _INPUT_UNION(ctypes.Union):
+    _fields_ = [
+        ("mi", _MOUSEINPUT),
+        ("ki", _KEYBDINPUT),
+        ("hi", _HARDWAREINPUT),
+    ]
+
+
+class _INPUT(ctypes.Structure):
+    _fields_ = [
+        ("type", wintypes.DWORD),
+        ("u", _INPUT_UNION),
+    ]
+
+
 # Явные 64-битные прототипы Win32 для безопасной передачи HWND/HDC без усечения на x64 Windows
 if sys.platform == "win32":
     user32.GetForegroundWindow.restype = wintypes.HWND
@@ -90,6 +150,8 @@ if sys.platform == "win32":
     user32.IsWindowVisible.argtypes = [wintypes.HWND]
     user32.IsIconic.restype = wintypes.BOOL
     user32.IsIconic.argtypes = [wintypes.HWND]
+    user32.IsZoomed.restype = wintypes.BOOL
+    user32.IsZoomed.argtypes = [wintypes.HWND]
     user32.GetWindowThreadProcessId.restype = wintypes.DWORD
     user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
     user32.GetClientRect.restype = wintypes.BOOL
@@ -133,6 +195,14 @@ if sys.platform == "win32":
         wintypes.UINT,
     ]
     user32.AttachThreadInput.restype = wintypes.BOOL
+    user32.MonitorFromWindow.restype = wintypes.HMONITOR
+    user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+    user32.GetMonitorInfoW.restype = wintypes.BOOL
+    user32.GetMonitorInfoW.argtypes = [wintypes.HMONITOR, ctypes.POINTER(_MONITORINFO)]
+    user32.MapVirtualKeyW.restype = wintypes.UINT
+    user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
+    user32.SendInput.restype = wintypes.UINT
+    user32.SendInput.argtypes = [wintypes.UINT, ctypes.c_void_p, ctypes.c_int]
     user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
     ctypes.windll.kernel32.GetCurrentThreadId.restype = wintypes.DWORD
     ctypes.windll.kernel32.GetCurrentThreadId.argtypes = []
@@ -470,6 +540,147 @@ def bring_target_window_to_front(target_process: str = "XboxPcApp.exe") -> tuple
         return (True, is_min, False)
     except Exception:
         return (True, is_min, False)
+
+
+def evaluate_fullscreen_rect(
+    win_rect: tuple[int, int, int, int],
+    mon_rect: tuple[int, int, int, int],
+    work_rect: tuple[int, int, int, int],
+    style: int,
+    is_zoomed: bool = False,
+) -> bool:
+    """Определяет полноэкранный режим окна по геометрии монитора и стилю рамки (отличая Maximized от Fullscreen)."""
+    wl, wt, wr, wb = win_rect
+    ml, mt, mr, mb = mon_rect
+    if (mr - ml) <= 0 or (mb - mt) <= 0 or (wr - wl) <= 0 or (wb - wt) <= 0:
+        return False
+
+    covers_monitor = wl <= ml + 2 and wt <= mt + 2 and wr >= mr - 2 and wb >= mb - 2
+    if not covers_monitor:
+        return False
+
+    has_caption_and_frame = (style & _WS_CAPTION) == _WS_CAPTION and (style & _WS_THICKFRAME) != 0
+    exact_fit = wl >= ml - 2 and wt >= mt - 2 and wr <= mr + 2 and wb <= mb + 2
+    taskbar_exists = (
+        (work_rect[2] - work_rect[0]) < (mr - ml)
+        or (work_rect[3] - work_rect[1]) < (mb - mt)
+        or work_rect[0] > ml
+        or work_rect[1] > mt
+    )
+    # Развёрнутое (Maximized) окно с заголовком и автоскрытой панелью задач не считается полноэкранным
+    if has_caption_and_frame and is_zoomed and not taskbar_exists:
+        return False
+    return (not has_caption_and_frame) or exact_fit or taskbar_exists
+
+
+def is_window_fullscreen(hwnd: int) -> bool:
+    """Проверяет, развёрнуто ли окно hwnd в истинный полноэкранный режим."""
+    if sys.platform != "win32" or not hwnd:
+        return False
+    try:
+        if user32.IsIconic(hwnd) or not user32.IsWindowVisible(hwnd):
+            return False
+        rc = _RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rc)):
+            return False
+        hmon = user32.MonitorFromWindow(hwnd, _MONITOR_DEFAULTTONEAREST)
+        if not hmon:
+            return False
+        mi = _MONITORINFO()
+        mi.cbSize = ctypes.sizeof(_MONITORINFO)
+        if not user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+            return False
+        style = int(user32.GetWindowLongW(hwnd, _GWL_STYLE) or 0)
+        zoomed = bool(user32.IsZoomed(hwnd))
+        return evaluate_fullscreen_rect(
+            (int(rc.left), int(rc.top), int(rc.right), int(rc.bottom)),
+            (int(mi.rcMonitor.left), int(mi.rcMonitor.top), int(mi.rcMonitor.right), int(mi.rcMonitor.bottom)),
+            (int(mi.rcWork.left), int(mi.rcWork.top), int(mi.rcWork.right), int(mi.rcWork.bottom)),
+            style,
+            is_zoomed=zoomed,
+        )
+    except Exception:
+        return False
+
+
+def _is_target_hwnd_foreground(hwnd: int, target_process: str) -> bool:
+    """Проверяет, что активное окно Windows (GetForegroundWindow) — это именно целевое окно или его процесс."""
+    if sys.platform != "win32" or not hwnd:
+        return False
+    try:
+        fg = int(user32.GetForegroundWindow() or 0)
+        if not fg:
+            return False
+        if fg == hwnd:
+            return True
+        fg_pid = wintypes.DWORD(0)
+        tgt_pid = wintypes.DWORD(0)
+        user32.GetWindowThreadProcessId(fg, ctypes.byref(fg_pid))
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(tgt_pid))
+        if fg_pid.value and tgt_pid.value and fg_pid.value == tgt_pid.value:
+            return True
+        fg_proc = _process_name_by_pid(int(fg_pid.value))
+        return bool(fg_proc and _process_matches_target(fg_proc, target_process))
+    except Exception:
+        return False
+
+
+def _send_vk_f11() -> bool:
+    """Отправляет физическое нажатие клавиши F11 текущему подтверждённому целевому окну."""
+    if sys.platform != "win32":
+        return False
+    scan = int(user32.MapVirtualKeyW(_VK_F11, 0) or 0)
+    down = _INPUT(
+        type=_INPUT_KEYBOARD,
+        u=_INPUT_UNION(ki=_KEYBDINPUT(wVk=_VK_F11, wScan=scan, dwFlags=0, time=0, dwExtraInfo=0)),
+    )
+    up = _INPUT(
+        type=_INPUT_KEYBOARD,
+        u=_INPUT_UNION(ki=_KEYBDINPUT(wVk=_VK_F11, wScan=scan, dwFlags=_KEYEVENTF_KEYUP, time=0, dwExtraInfo=0)),
+    )
+    arr = (_INPUT * 2)(down, up)
+    sent = int(user32.SendInput(2, ctypes.byref(arr), ctypes.sizeof(_INPUT)))
+    return sent == 2
+
+
+def ensure_target_window_windowed(target_process: str = "XboxPcApp.exe") -> tuple[bool, bool]:
+    """Переводит окно выбранного процесса из полноэкранного режима в оконный.
+    Срабатывает только если конкретное окно действительно полноэкранное и получило фокус.
+    Возвращает (найдено_окно, был_ли_выход_из_полноэкранного_режима).
+    """
+    if sys.platform != "win32" or not target_process or not target_process.strip():
+        return (False, False)
+
+    found = find_target_window_hwnd(target_process, include_minimized=True)
+    if found is None:
+        return (False, False)
+
+    hwnd, is_min = found
+    if is_min or not is_window_fullscreen(hwnd):
+        return (True, False)
+
+    # Строго выводим на передний план именно это окно и ждём подтверждения фокуса до 320 мс
+    bring_target_window_to_front(target_process)
+    fg_ready = False
+    for _ in range(13):
+        if _is_target_hwnd_foreground(hwnd, target_process):
+            fg_ready = True
+            break
+        time.sleep(0.025)
+
+    # Никогда не отправляем клавишу переключения, если фокус не перешёл к целевому окну или окно уже не fullscreen
+    if not fg_ready or not is_window_fullscreen(hwnd):
+        return (True, False)
+
+    if not _send_vk_f11():
+        return (True, False)
+
+    # Ждём завершения перехода окна в неполноэкранный режим (до ~450 мс)
+    for _ in range(9):
+        time.sleep(0.05)
+        if not is_window_fullscreen(hwnd):
+            return (True, True)
+    return (True, True)
 
 
 def find_xbox_window_rect() -> Optional[Rect]:

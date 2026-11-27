@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import math
 import re
 import threading
@@ -410,7 +409,7 @@ class RapidOcrBackend:
         if not (paths["det"] and paths["rec"] and paths["keys"]):
             raise FileNotFoundError(
                 "Модели RapidOCR (PP-OCRv5 кириллица) не найдены в models/ocr/. "
-                "Установите их через Мастер компонентов или переключитесь на Windows OCR."
+                "Установите их через Мастер компонентов."
             )
 
         kwargs: dict = {
@@ -480,141 +479,8 @@ class RapidOcrBackend:
         )
 
 
-class WinRtOcrBackend:
-    """Сверхэкономичный по ОЗУ движок Windows.Media.Ocr (WinRT) с универсальной проверкой 2D-HUD и геометрии."""
-
-    def __init__(self, font_classifier: Optional[SubtitleFontClassifier] = None) -> None:
-        self.font_classifier = font_classifier
-        self.font_classifier_enabled = True
-        self._engine = None
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._lock = threading.Lock()
-
-    def _ensure_loaded(self) -> None:
-        if self._engine is not None:
-            return
-        from winrt.windows.globalization import Language
-        from winrt.windows.media.ocr import OcrEngine
-
-        lang = Language("ru")
-        if OcrEngine.is_language_supported(lang):
-            self._engine = OcrEngine.try_create_from_language(lang)
-        if self._engine is None:
-            self._engine = OcrEngine.try_create_from_user_profile_languages()
-        if self._engine is None:
-            raise RuntimeError("Windows OCR (ru) недоступен в системе.")
-        self._loop = asyncio.new_event_loop()
-
-    async def _recognize_async(self, bgr: np.ndarray) -> tuple[list[OcrLine], int]:
-        import cv2
-        from winrt.windows.graphics.imaging import BitmapPixelFormat, SoftwareBitmap
-        from winrt.windows.storage.streams import DataWriter
-
-        prep, scale, pad = preprocess_roi_for_ocr(bgr, target_h_min=64, target_h_max=280, padding=0)
-        bgra = cv2.cvtColor(prep, cv2.COLOR_BGR2BGRA)
-        h, w = bgra.shape[:2]
-        writer = DataWriter()
-        sb = None
-        try:
-            writer.write_bytes(bgra.tobytes())
-            buf = writer.detach_buffer()
-            sb = SoftwareBitmap.create_copy_from_buffer(buf, BitmapPixelFormat.BGRA8, w, h)
-            result = await self._engine.recognize_async(sb)
-        finally:
-            if sb is not None:
-                try:
-                    sb.close()
-                except Exception:
-                    pass
-            try:
-                writer.close()
-            except Exception:
-                pass
-
-        # WinRT возвращает общий угол text_angle (в градусах), когда читается наклонный 3D-экран телефона
-        winrt_angle = float(getattr(result, "text_angle", None) or 0.0)
-        if abs(winrt_angle) > 2.2:
-            return [], len(list(result.lines))
-
-        lines: list[OcrLine] = []
-        rejected = 0
-        rh, rw = bgr.shape[:2]
-        for line in result.lines:
-            ltext = (line.text or "").strip()
-            if not ltext:
-                continue
-            words = list(line.words)
-            if words:
-                xs0 = [(wd.bounding_rect.x - pad) / scale for wd in words]
-                ys0 = [(wd.bounding_rect.y - pad) / scale for wd in words]
-                xs1 = [(wd.bounding_rect.x + wd.bounding_rect.width - pad) / scale for wd in words]
-                ys1 = [(wd.bounding_rect.y + wd.bounding_rect.height - pad) / scale for wd in words]
-                x0 = max(0, int(np.floor(min(xs0))))
-                y0 = max(0, int(np.floor(min(ys0))))
-                x1 = min(rw, int(np.ceil(max(xs1))))
-                y1 = min(rh, int(np.ceil(max(ys1))))
-            else:
-                x0, y0, x1, y1 = 0, 0, rw, rh
-
-            ok, contrast, _ = verify_subtitle_box(bgr, x0, y0, x1, y1, angle_deg=winrt_angle)
-            if not ok:
-                rejected += 1
-                continue
-
-            lines.append(
-                OcrLine(
-                    text=ltext,
-                    bbox=(x0, y0, x1, y1),
-                    angle_deg=winrt_angle,
-                    stroke_contrast=contrast,
-                    confidence=1.0,
-                )
-            )
-
-        if self.font_classifier_enabled and self.font_classifier is not None and self.font_classifier.is_available and lines:
-            probs = self.font_classifier.score_boxes(bgr, [ln.bbox for ln in lines])
-            kept_lines: list[OcrLine] = []
-            for ln, prob in zip(lines, probs):
-                if prob >= self.font_classifier.threshold:
-                    kept_lines.append(ln)
-                else:
-                    rejected += 1
-            lines = kept_lines
-
-        lines.sort(key=lambda ln: (ln.bbox[1], ln.bbox[0]))
-        lines, extra_rej = _filter_grouped_subtitle_lines(lines, rw, tilted_wide_count=0)
-        return lines, rejected + extra_rej
-
-    def recognize(self, bgr: np.ndarray) -> OcrResult:
-        t0 = time.perf_counter()
-        with self._lock:
-            self._ensure_loaded()
-            lines, rejected = self._loop.run_until_complete(self._recognize_async(bgr))
-        elapsed_ms = (time.perf_counter() - t0) * 1000.0
-        full_text = "\n".join(ln.text for ln in lines)
-        return OcrResult(
-            text=full_text,
-            elapsed_ms=elapsed_ms,
-            engine="winrt",
-            confidence=1.0 if lines else 0.0,
-            lines=lines,
-            rejected_boxes=rejected,
-        )
-
-    def close(self) -> None:
-        with self._lock:
-            if self._loop is not None:
-                try:
-                    if not self._loop.is_closed():
-                        self._loop.close()
-                except Exception:
-                    pass
-                self._loop = None
-            self._engine = None
-
-
 class OcrEngineManager:
-    """Единый фасад OCR с поддержкой RapidOCR (по умолчанию) и Windows OCR (WinRT) с резервным откатом."""
+    """Единый фасад OCR на базе локального RapidOCR (ONNX PP-OCRv5 Кириллица)."""
 
     def __init__(
         self,
@@ -622,30 +488,21 @@ class OcrEngineManager:
         num_threads: int = 4,
         font_classifier_enabled: bool = True,
     ) -> None:
-        self.engine_name = engine_name
+        self.engine_name = "rapidocr"
         self.num_threads = num_threads
         self.font_classifier_enabled = bool(font_classifier_enabled)
         self._font_clf = SubtitleFontClassifier(num_threads=max(1, min(2, int(num_threads))))
         self._rapid: Optional[RapidOcrBackend] = None
-        self._winrt: Optional[WinRtOcrBackend] = None
 
     def set_engine(self, engine_name: str) -> None:
-        if engine_name in ("rapidocr", "winrt"):
-            self.engine_name = engine_name
+        self.engine_name = "rapidocr"
 
     def set_font_classifier_enabled(self, enabled: bool) -> None:
         self.font_classifier_enabled = bool(enabled)
         if self._rapid is not None:
             self._rapid.font_classifier_enabled = self.font_classifier_enabled
-        if self._winrt is not None:
-            self._winrt.font_classifier_enabled = self.font_classifier_enabled
 
-    def _get_backend(self):
-        if self.engine_name == "winrt":
-            if self._winrt is None:
-                self._winrt = WinRtOcrBackend(font_classifier=self._font_clf)
-            self._winrt.font_classifier_enabled = self.font_classifier_enabled
-            return self._winrt
+    def _get_backend(self) -> RapidOcrBackend:
         if self._rapid is None:
             self._rapid = RapidOcrBackend(num_threads=self.num_threads, font_classifier=self._font_clf)
         self._rapid.font_classifier_enabled = self.font_classifier_enabled
@@ -654,26 +511,10 @@ class OcrEngineManager:
     def warmup(self) -> None:
         if self.font_classifier_enabled:
             _ = self._font_clf.is_available
-        backend = self._get_backend()
-        if isinstance(backend, RapidOcrBackend):
-            backend.warmup()
+        self._get_backend().warmup()
 
     def recognize(self, bgr: np.ndarray) -> OcrResult:
-        try:
-            return self._get_backend().recognize(bgr)
-        except Exception:
-            if self.engine_name == "winrt":
-                if self._rapid is None:
-                    self._rapid = RapidOcrBackend(num_threads=self.num_threads, font_classifier=self._font_clf)
-                self._rapid.font_classifier_enabled = self.font_classifier_enabled
-                return self._rapid.recognize(bgr)
-            else:
-                if self._winrt is None:
-                    self._winrt = WinRtOcrBackend(font_classifier=self._font_clf)
-                self._winrt.font_classifier_enabled = self.font_classifier_enabled
-                return self._winrt.recognize(bgr)
+        return self._get_backend().recognize(bgr)
 
     def close(self) -> None:
-        if self._winrt is not None:
-            self._winrt.close()
-            self._winrt = None
+        self._rapid = None

@@ -315,7 +315,7 @@ class TactileSlider(QSlider):
 class AnimatedStatusBadge(QWidget):
     """Матовая плашка статуса с плавно пульсирующим индикатором во время работы или загрузки."""
 
-    def __init__(self, initial_text: str = "Загрузка...", parent: Optional[QWidget] = None) -> None:
+    def __init__(self, initial_text: str = "Запуск...", parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._text = initial_text
         self._color = QColor("#FF7A45")

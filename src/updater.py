@@ -274,6 +274,20 @@ def prepare_extracted_user_data(source_app_dir: Path, current_data_dir: Path = D
             pass
 
 
+def _ps_quote(value: str) -> str:
+    """Экранирует строку для безопасной передачи в PowerShell-литерале '...'."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _resolve_powershell_exe() -> str:
+    """Возвращает полный путь к системному Windows PowerShell 5.1+."""
+    sys_root = os.environ.get("SystemRoot", r"C:\Windows")
+    candidate = Path(sys_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    if candidate.is_file():
+        return str(candidate)
+    return "powershell.exe"
+
+
 def build_windows_updater_script(
     pid: int,
     source_dir: Path,
@@ -281,40 +295,423 @@ def build_windows_updater_script(
     staging_root: Path,
     exe_name: str = f"{APP_NAME}.exe",
 ) -> str:
-    """Генерирует .cmd-скрипт Windows, который ждёт выхода приложения, обновляет файлы и запускает его заново."""
+    """Генерирует PowerShell-скрипт (.ps1) с окном прогресса, откатом при сбое и перезапуском."""
     pid_int = int(pid)
-    src = str(source_dir)
-    dst = str(target_dir)
-    stg = str(staging_root)
-    return "\r\n".join(
-        [
-            "@echo off",
-            "chcp 65001 >nul",
-            "setlocal enableextensions",
-            f'set "TARGET_PID={pid_int}"',
-            f'set "SRC_DIR={src}"',
-            f'set "DST_DIR={dst}"',
-            f'set "STG_DIR={stg}"',
-            f'set "EXE_NAME={exe_name}"',
-            "",
-            "set /a WAIT_COUNT=0",
-            ":wait_loop",
-            'tasklist /FI "PID eq %TARGET_PID%" /NH 2>nul | findstr /R "\\<%TARGET_PID%\\>" >nul',
-            "if errorlevel 1 goto do_update",
-            "set /a WAIT_COUNT+=1",
-            "if %WAIT_COUNT% GEQ 40 goto do_update",
-            "ping -n 2 127.0.0.1 >nul",
-            "goto wait_loop",
-            "",
-            ":do_update",
-            "ping -n 2 127.0.0.1 >nul",
-            'if exist "%DST_DIR%\\_internal" rmdir /s /q "%DST_DIR%\\_internal" >nul 2>&1',
-            'xcopy "%SRC_DIR%\\*" "%DST_DIR%\\" /E /I /Y /Q >nul',
-            'start "" "%DST_DIR%\\%EXE_NAME%"',
-            'if exist "%STG_DIR%" rmdir /s /q "%STG_DIR%" >nul 2>&1',
-            '(goto) 2>nul & del "%~f0"',
-        ]
-    )
+    ps_src = _ps_quote(str(source_dir))
+    ps_dst = _ps_quote(str(target_dir))
+    ps_stg = _ps_quote(str(staging_root))
+    ps_exe = _ps_quote(str(exe_name))
+
+    return f"""param(
+    [switch]$NoGui,
+    [switch]$SkipRelaunch
+)
+
+$ErrorActionPreference = 'Stop'
+$TargetPid = {pid_int}
+$SrcDir = {ps_src}
+$DstDir = {ps_dst}
+$StgDir = {ps_stg}
+$ExeName = {ps_exe}
+$SelfScriptPath = $PSCommandPath
+$LogPath = Join-Path $env:TEMP 'gta6subvoice_update.log'
+
+function Write-UpdateLog([string]$Message) {{
+    try {{
+        $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        Add-Content -LiteralPath $LogPath -Value "[$ts] $Message" -Encoding UTF8 -ErrorAction SilentlyContinue
+    }} catch {{}}
+}}
+
+Write-UpdateLog "=== Старт установщика обновления (PID=$TargetPid) ==="
+Write-UpdateLog "SrcDir=$SrcDir | DstDir=$DstDir | StgDir=$StgDir | Exe=$ExeName"
+
+$Form = $null
+$LblTitle = $null
+$LblStatus = $null
+$Progress = $null
+$LblHint = $null
+$BtnRetry = $null
+$BtnClose = $null
+
+function Pump-Gui {{
+    if (-not $NoGui -and $null -ne $Form) {{
+        [System.Windows.Forms.Application]::DoEvents()
+    }}
+}}
+
+function Set-Progress([int]$Percent, [string]$Text, [bool]$IsError = $false) {{
+    Write-UpdateLog "[$Percent%] $Text"
+    if ($NoGui -or $null -eq $Form) {{
+        return
+    }}
+    $p = [Math]::Max(0, [Math]::Min(100, $Percent))
+    $Progress.Value = $p
+    $LblStatus.Text = $Text
+    if ($IsError) {{
+        $LblTitle.Text = 'Ошибка обновления'
+        $LblTitle.ForeColor = [System.Drawing.Color]::FromArgb(255, 77, 109)
+        $LblStatus.ForeColor = [System.Drawing.Color]::FromArgb(255, 168, 180)
+        $LblHint.Text = "Подробности сохранены в лог: $LogPath"
+        $BtnRetry.Visible = $true
+        $BtnClose.Visible = $true
+    }} else {{
+        $LblTitle.Text = 'Обновление GTA VI SubVoice'
+        $LblTitle.ForeColor = [System.Drawing.Color]::FromArgb(0, 229, 195)
+        $LblStatus.ForeColor = [System.Drawing.Color]::FromArgb(232, 230, 245)
+        $LblHint.Text = 'Пожалуйста, подождите — окно закроется автоматически.'
+        $BtnRetry.Visible = $false
+        $BtnClose.Visible = $false
+    }}
+    Pump-Gui
+}}
+
+function Wait-WithPump([int]$TotalMs) {{
+    $elapsed = 0
+    while ($elapsed -lt $TotalMs) {{
+        Pump-Gui
+        $step = [Math]::Min(100, $TotalMs - $elapsed)
+        [System.Threading.Thread]::Sleep($step)
+        $elapsed += $step
+    }}
+}}
+
+function Invoke-WithRetry([string]$OpName, [int]$MaxAttempts, [int]$DelayMs, [scriptblock]$Action) {{
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {{
+        try {{
+            & $Action
+            return
+        }} catch {{
+            $errMsg = $_.Exception.Message
+            Write-UpdateLog "Попытка $attempt/$MaxAttempts ($OpName) не удалась: $errMsg"
+            if ($attempt -ge $MaxAttempts) {{
+                throw
+            }}
+            Wait-WithPump $DelayMs
+        }}
+    }}
+}}
+
+function Copy-MergedDirectory([string]$FromDir, [string]$ToDir, [int]$BasePercent, [int]$SpanPercent, [bool]$ProtectUserData = $false) {{
+    if (-not (Test-Path -LiteralPath $ToDir)) {{
+        New-Item -ItemType Directory -Path $ToDir -Force | Out-Null
+    }}
+    $allFiles = @(Get-ChildItem -LiteralPath $FromDir -Recurse -File -Force)
+    $allDirs = @(Get-ChildItem -LiteralPath $FromDir -Recurse -Directory -Force)
+    $fromRoot = $FromDir.TrimEnd('\\', '/')
+
+    foreach ($d in $allDirs) {{
+        $rel = $d.FullName.Substring($fromRoot.Length).TrimStart('\\', '/')
+        $targetSub = Join-Path $ToDir $rel
+        if (-not (Test-Path -LiteralPath $targetSub)) {{
+            New-Item -ItemType Directory -Path $targetSub -Force | Out-Null
+        }}
+    }}
+
+    $total = [Math]::Max(1, $allFiles.Count)
+    $idx = 0
+    foreach ($f in $allFiles) {{
+        $idx++
+        $rel = $f.FullName.Substring($fromRoot.Length).TrimStart('\\', '/')
+        $destFile = Join-Path $ToDir $rel
+        if ($ProtectUserData) {{
+            $relNorm = $rel.Replace('/', '\\').ToLowerInvariant()
+            if (($relNorm -eq 'config.json' -or $relNorm -eq 'characters.json') -and (Test-Path -LiteralPath $destFile)) {{
+                continue
+            }}
+        }}
+        $destParent = Split-Path -Path $destFile -Parent
+        if (-not (Test-Path -LiteralPath $destParent)) {{
+            New-Item -ItemType Directory -Path $destParent -Force | Out-Null
+        }}
+        Invoke-WithRetry "Копирование $rel" 15 350 {{
+            Copy-Item -LiteralPath $f.FullName -Destination $destFile -Force
+        }}
+        if (($idx % 30 -eq 0) -or ($idx -eq $total)) {{
+            $pct = $BasePercent + [int](($idx / $total) * $SpanPercent)
+            Set-Progress $pct "Устанавливаю файлы ($idx/$total)..."
+        }} else {{
+            Pump-Gui
+        }}
+    }}
+}}
+
+function Wait-TargetProcessesExit {{
+    Set-Progress 10 'Ожидаю закрытия старой версии...'
+    for ($i = 0; $i -lt 40; $i++) {{
+        $proc = Get-Process -Id $TargetPid -ErrorAction SilentlyContinue
+        if ($null -eq $proc) {{
+            break
+        }}
+        Wait-WithPump 200
+    }}
+
+    $proc = Get-Process -Id $TargetPid -ErrorAction SilentlyContinue
+    if ($null -ne $proc) {{
+        Write-UpdateLog "PID $TargetPid всё ещё активен после ожидания — принудительное завершение."
+        Set-Progress 15 'Завершаю зависший процесс программы...'
+        Stop-Process -Id $TargetPid -Force -ErrorAction SilentlyContinue
+        for ($j = 0; $j -lt 15; $j++) {{
+            $proc = Get-Process -Id $TargetPid -ErrorAction SilentlyContinue
+            if ($null -eq $proc) {{
+                break
+            }}
+            Wait-WithPump 200
+        }}
+    }}
+
+    # Проверяем, не запущена ли другая копия именно из целевой папки установки
+    $expectedExe = (Join-Path $DstDir $ExeName)
+    $exeBaseName = [System.IO.Path]::GetFileNameWithoutExtension($ExeName)
+    try {{
+        $others = @(Get-Process -Name $exeBaseName -ErrorAction SilentlyContinue)
+        foreach ($p in $others) {{
+            try {{
+                if ($p.Path -and ($p.Path -ieq $expectedExe)) {{
+                    Write-UpdateLog "Закрываю дополнительный экземпляр PID=$($p.Id) из $expectedExe"
+                    Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+                }}
+            }} catch {{}}
+        }}
+    }} catch {{}}
+
+    # Небольшая пауза, чтобы Windows и Defender гарантированно отпустили DLL
+    Wait-WithPump 350
+}}
+
+function Run-UpdateTransaction {{
+    $DstInternal = Join-Path $DstDir '_internal'
+    $BackupInternal = Join-Path $DstDir '_internal_backup'
+    $SrcInternal = Join-Path $SrcDir '_internal'
+    $DstExe = Join-Path $DstDir $ExeName
+    $BackupExe = Join-Path $DstDir ($ExeName + '.bak')
+    $MovedInternalFromSrc = $false
+
+    try {{
+        if (-not (Test-Path -LiteralPath $SrcDir)) {{
+            throw "Папка обновления не найдена: $SrcDir"
+        }}
+        if (-not (Test-Path -LiteralPath $DstDir)) {{
+            New-Item -ItemType Directory -Path $DstDir -Force | Out-Null
+        }}
+
+        Wait-TargetProcessesExit
+
+        Set-Progress 25 'Создаю резервную копию...'
+        if (Test-Path -LiteralPath $BackupInternal) {{
+            Invoke-WithRetry 'Очистка старого бэкапа _internal_backup' 10 350 {{
+                Remove-Item -LiteralPath $BackupInternal -Recurse -Force
+            }}
+        }}
+        if (Test-Path -LiteralPath $BackupExe) {{
+            Invoke-WithRetry 'Очистка старого бэкапа exe' 10 350 {{
+                Remove-Item -LiteralPath $BackupExe -Force
+            }}
+        }}
+
+        if (Test-Path -LiteralPath $DstInternal) {{
+            Invoke-WithRetry 'Перенос _internal в резервную копию' 15 400 {{
+                Move-Item -LiteralPath $DstInternal -Destination $BackupInternal -Force
+            }}
+        }}
+        if (Test-Path -LiteralPath $DstExe) {{
+            Invoke-WithRetry "Перенос $ExeName в резервную копию" 15 400 {{
+                Move-Item -LiteralPath $DstExe -Destination $BackupExe -Force
+            }}
+        }}
+
+        Set-Progress 40 'Устанавливаю новые файлы...'
+        if (Test-Path -LiteralPath $SrcInternal) {{
+            $sameRoot = ([System.IO.Path]::GetPathRoot($SrcInternal) -ieq [System.IO.Path]::GetPathRoot($DstDir))
+            $fastMoved = $false
+            if ($sameRoot) {{
+                try {{
+                    Invoke-WithRetry 'Быстрый перенос _internal' 5 300 {{
+                        Move-Item -LiteralPath $SrcInternal -Destination $DstInternal -Force
+                    }}
+                    $fastMoved = $true
+                    $MovedInternalFromSrc = $true
+                }} catch {{
+                    Write-UpdateLog "Быстрый Move-Item _internal не удался, перехожу к копированию: $($_.Exception.Message)"
+                }}
+            }}
+            if (-not $fastMoved) {{
+                Copy-MergedDirectory -FromDir $SrcInternal -ToDir $DstInternal -BasePercent 42 -SpanPercent 32
+            }}
+        }}
+
+        Set-Progress 75 'Обновляю исполняемый файл и ресурсы...'
+        $topItems = @(Get-ChildItem -LiteralPath $SrcDir -Force)
+        foreach ($item in $topItems) {{
+            if ($item.Name -eq '_internal') {{
+                continue
+            }}
+            $targetPath = Join-Path $DstDir $item.Name
+            if ($item.PSIsContainer) {{
+                $isData = ($item.Name -ieq 'data')
+                Copy-MergedDirectory -FromDir $item.FullName -ToDir $targetPath -BasePercent 76 -SpanPercent 10 -ProtectUserData:$isData
+            }} else {{
+                Invoke-WithRetry "Копирование $($item.Name)" 15 400 {{
+                    Copy-Item -LiteralPath $item.FullName -Destination $targetPath -Force
+                }}
+            }}
+            Pump-Gui
+        }}
+
+        if (-not (Test-Path -LiteralPath $DstExe)) {{
+            throw "После копирования не найден главный файл: $DstExe"
+        }}
+
+        Set-Progress 90 'Очищаю временные файлы...'
+        if (Test-Path -LiteralPath $BackupInternal) {{
+            Remove-Item -LiteralPath $BackupInternal -Recurse -Force -ErrorAction SilentlyContinue
+        }}
+        if (Test-Path -LiteralPath $BackupExe) {{
+            Remove-Item -LiteralPath $BackupExe -Force -ErrorAction SilentlyContinue
+        }}
+        if ($StgDir -and (Test-Path -LiteralPath $StgDir)) {{
+            Remove-Item -LiteralPath $StgDir -Recurse -Force -ErrorAction SilentlyContinue
+        }}
+
+        if (-not $SkipRelaunch) {{
+            Set-Progress 96 'Запускаю обновлённую версию...'
+            Start-Process -FilePath $DstExe -ArgumentList '--after-update' -WorkingDirectory $DstDir | Out-Null
+        }}
+        Set-Progress 100 'Обновление успешно установлено!'
+        Wait-WithPump 500
+        return $true
+    }} catch {{
+        $errText = $_.Exception.Message
+        Write-UpdateLog "ОШИБКА ОБНОВЛЕНИЯ: $errText"
+        try {{
+            if ($MovedInternalFromSrc -and (Test-Path -LiteralPath $DstInternal) -and (-not (Test-Path -LiteralPath $SrcInternal))) {{
+                Move-Item -LiteralPath $DstInternal -Destination $SrcInternal -Force -ErrorAction SilentlyContinue
+            }} elseif ((Test-Path -LiteralPath $BackupInternal) -and (Test-Path -LiteralPath $DstInternal)) {{
+                Remove-Item -LiteralPath $DstInternal -Recurse -Force -ErrorAction SilentlyContinue
+            }}
+            if ((Test-Path -LiteralPath $BackupInternal) -and (-not (Test-Path -LiteralPath $DstInternal))) {{
+                Move-Item -LiteralPath $BackupInternal -Destination $DstInternal -Force -ErrorAction SilentlyContinue
+            }}
+            if (Test-Path -LiteralPath $BackupExe) {{
+                Move-Item -LiteralPath $BackupExe -Destination $DstExe -Force -ErrorAction SilentlyContinue
+            }}
+        }} catch {{
+            Write-UpdateLog "Ошибка отката: $($_.Exception.Message)"
+        }}
+        Set-Progress 0 "Не удалось обновить: $errText" $true
+        return $false
+    }}
+}}
+
+$script:ExitCode = 0
+if ($NoGui) {{
+    $ok = Run-UpdateTransaction
+    if (-not $ok) {{
+        $script:ExitCode = 1
+    }}
+}} else {{
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+    [System.Windows.Forms.Application]::EnableVisualStyles()
+
+    $Form = New-Object System.Windows.Forms.Form
+    $Form.Text = 'Обновление GTA VI SubVoice'
+    $Form.ClientSize = New-Object System.Drawing.Size(450, 178)
+    $Form.StartPosition = 'CenterScreen'
+    $Form.FormBorderStyle = 'FixedDialog'
+    $Form.MaximizeBox = $false
+    $Form.MinimizeBox = $false
+    $Form.ControlBox = $false
+    $Form.TopMost = $true
+    $Form.BackColor = [System.Drawing.Color]::FromArgb(14, 13, 27)
+    $Form.ForeColor = [System.Drawing.Color]::FromArgb(244, 243, 250)
+
+    $LblTitle = New-Object System.Windows.Forms.Label
+    $LblTitle.Location = New-Object System.Drawing.Point(20, 16)
+    $LblTitle.Size = New-Object System.Drawing.Size(410, 24)
+    $LblTitle.Font = New-Object System.Drawing.Font('Segoe UI', 12, [System.Drawing.FontStyle]::Bold)
+    $LblTitle.ForeColor = [System.Drawing.Color]::FromArgb(0, 229, 195)
+    $LblTitle.Text = 'Обновление GTA VI SubVoice'
+    $Form.Controls.Add($LblTitle)
+
+    $LblStatus = New-Object System.Windows.Forms.Label
+    $LblStatus.Location = New-Object System.Drawing.Point(20, 46)
+    $LblStatus.Size = New-Object System.Drawing.Size(410, 34)
+    $LblStatus.Font = New-Object System.Drawing.Font('Segoe UI', 9.5)
+    $LblStatus.ForeColor = [System.Drawing.Color]::FromArgb(232, 230, 245)
+    $LblStatus.Text = 'Подготовка к установке...'
+    $Form.Controls.Add($LblStatus)
+
+    $Progress = New-Object System.Windows.Forms.ProgressBar
+    $Progress.Location = New-Object System.Drawing.Point(20, 86)
+    $Progress.Size = New-Object System.Drawing.Size(410, 20)
+    $Progress.Minimum = 0
+    $Progress.Maximum = 100
+    $Progress.Style = 'Continuous'
+    $Form.Controls.Add($Progress)
+
+    $LblHint = New-Object System.Windows.Forms.Label
+    $LblHint.Location = New-Object System.Drawing.Point(20, 114)
+    $LblHint.Size = New-Object System.Drawing.Size(410, 22)
+    $LblHint.Font = New-Object System.Drawing.Font('Segoe UI', 8.5)
+    $LblHint.ForeColor = [System.Drawing.Color]::FromArgb(154, 150, 176)
+    $LblHint.Text = 'Пожалуйста, подождите — окно закроется автоматически.'
+    $Form.Controls.Add($LblHint)
+
+    $BtnRetry = New-Object System.Windows.Forms.Button
+    $BtnRetry.Location = New-Object System.Drawing.Point(242, 140)
+    $BtnRetry.Size = New-Object System.Drawing.Size(92, 28)
+    $BtnRetry.Text = 'Повторить'
+    $BtnRetry.FlatStyle = 'Flat'
+    $BtnRetry.BackColor = [System.Drawing.Color]::FromArgb(0, 229, 195)
+    $BtnRetry.ForeColor = [System.Drawing.Color]::FromArgb(11, 10, 22)
+    $BtnRetry.Visible = $false
+    $Form.Controls.Add($BtnRetry)
+
+    $BtnClose = New-Object System.Windows.Forms.Button
+    $BtnClose.Location = New-Object System.Drawing.Point(340, 140)
+    $BtnClose.Size = New-Object System.Drawing.Size(90, 28)
+    $BtnClose.Text = 'Закрыть'
+    $BtnClose.FlatStyle = 'Flat'
+    $BtnClose.BackColor = [System.Drawing.Color]::FromArgb(35, 33, 60)
+    $BtnClose.ForeColor = [System.Drawing.Color]::FromArgb(244, 243, 250)
+    $BtnClose.Visible = $false
+    $Form.Controls.Add($BtnClose)
+
+    $script:IsRunningUpdate = $false
+    $BtnRetry.Add_Click({{
+        if ($script:IsRunningUpdate) {{ return }}
+        $script:IsRunningUpdate = $true
+        $ok = Run-UpdateTransaction
+        $script:IsRunningUpdate = $false
+        if ($ok) {{
+            $script:ExitCode = 0
+            $Form.Close()
+        }}
+    }})
+    $BtnClose.Add_Click({{
+        $script:ExitCode = 1
+        $Form.Close()
+    }})
+    $Form.Add_Shown({{
+        if ($script:IsRunningUpdate) {{ return }}
+        $script:IsRunningUpdate = $true
+        $ok = Run-UpdateTransaction
+        $script:IsRunningUpdate = $false
+        if ($ok) {{
+            $script:ExitCode = 0
+            $Form.Close()
+        }}
+    }})
+
+    [void]$Form.ShowDialog()
+}}
+
+if ($script:ExitCode -eq 0 -and $SelfScriptPath -and (Test-Path -LiteralPath $SelfScriptPath)) {{
+    Remove-Item -LiteralPath $SelfScriptPath -Force -ErrorAction SilentlyContinue
+}}
+exit $script:ExitCode
+"""
 
 
 def create_staging_dir() -> Path:
@@ -328,7 +725,7 @@ def create_staging_dir() -> Path:
 
 
 def launch_self_update(source_app_dir: Path, staging_root: Path, target_app_dir: Path = APP_DIR) -> None:
-    """Готовит и запускает фоновый .cmd-скрипт обновления, чтобы приложение могло полностью закрыться."""
+    """Готовит и запускает внешний PowerShell-установщик обновления с окном прогресса."""
     if sys.platform != "win32":
         raise RuntimeError("Автообновление поддерживается только на Windows.")
 
@@ -339,18 +736,33 @@ def launch_self_update(source_app_dir: Path, staging_root: Path, target_app_dir:
         target_dir=target_app_dir,
         staging_root=staging_root,
     )
-    script_path = Path(tempfile.gettempdir()) / f"gta6subvoice_update_{os.getpid()}.cmd"
-    script_path.write_text(script_text, encoding="utf-8")
+    script_path = Path(tempfile.gettempdir()) / f"gta6subvoice_update_{os.getpid()}.ps1"
+    # BOM обязателен для корректного чтения кириллицы в Windows PowerShell 5.1
+    script_path.write_text(script_text, encoding="utf-8-sig")
+
+    ps_exe = _resolve_powershell_exe()
+    ps_args = [
+        ps_exe,
+        "-NoProfile",
+        "-STA",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-WindowStyle",
+        "Hidden",
+        "-File",
+        str(script_path),
+    ]
 
     # Если целевая папка защищена от записи обычного пользователя (например Program Files), запрашиваем UAC
     if not is_dir_writable(target_app_dir):
         import ctypes
 
+        arg_line = f'-NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File "{script_path}"'
         rc = ctypes.windll.shell32.ShellExecuteW(
             None,
             "runas",
-            "cmd.exe",
-            f'/c "{script_path}"',
+            ps_exe,
+            arg_line,
             str(tempfile.gettempdir()),
             0,
         )
@@ -358,11 +770,9 @@ def launch_self_update(source_app_dir: Path, staging_root: Path, target_app_dir:
             raise PermissionError("Не получены права администратора для обновления папки программы.")
         return
 
-    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) | getattr(
-        subprocess, "DETACHED_PROCESS", 0x00000008
-    )
+    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
     subprocess.Popen(
-        ["cmd.exe", "/c", str(script_path)],
+        ps_args,
         cwd=str(tempfile.gettempdir()),
         creationflags=creation_flags,
         close_fds=True,

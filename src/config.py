@@ -75,7 +75,7 @@ class AppConfig:
     sample_rate: int = 48000
     scan_fps: int = 8
     debounce_ms: int = 50
-    ocr_engine: str = "rapidocr"  # «rapidocr» | «winrt»
+    ocr_engine: str = "rapidocr"  # Единственный поддерживаемый OCR-движок: «rapidocr»
     caps_ratio_threshold: float = 0.72
     dedup_threshold: float = 82.0
     enable_punctuation: bool = True
@@ -214,9 +214,10 @@ class AppConfig:
 
         cfg.scan_fps = max(2, min(30, int(raw.get("scan_fps", cfg.scan_fps))))
         cfg.debounce_ms = max(0, min(500, int(raw.get("debounce_ms", cfg.debounce_ms))))
-        cfg.ocr_engine = str(raw.get("ocr_engine", cfg.ocr_engine))
-        if cfg.ocr_engine not in ("rapidocr", "winrt"):
-            cfg.ocr_engine = "rapidocr"
+        raw_ocr = str(raw.get("ocr_engine", "rapidocr") or "rapidocr")
+        if raw_ocr != "rapidocr":
+            migrated = True
+        cfg.ocr_engine = "rapidocr"
 
         cfg.caps_ratio_threshold = max(0.3, min(1.0, float(raw.get("caps_ratio_threshold", cfg.caps_ratio_threshold))))
         cfg.dedup_threshold = max(50.0, min(100.0, float(raw.get("dedup_threshold", cfg.dedup_threshold))))

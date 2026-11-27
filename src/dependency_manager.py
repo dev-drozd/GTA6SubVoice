@@ -72,8 +72,8 @@ COMPONENT_MANIFEST: tuple[ComponentSpec, ...] = (
     ComponentSpec(
         id="rapidocr_cyrillic",
         name="RapidOCR PP-OCRv5 (Кириллица ONNX)",
-        description="Точный локальный OCR для цветных имён и мелкой пунктуации (можно пропустить при использовании Windows OCR).",
-        required=False,
+        description="Локальный OCR-движок для распознавания русских субтитров, имён и пунктуации.",
+        required=True,
         files=(
             ComponentFileSpec(
                 rel_path="ocr/ch_PP-OCRv5_mobile_det.onnx",
@@ -124,7 +124,6 @@ class PreflightReport:
     components: list[ComponentCheckResult] = field(default_factory=list)
     writable_ok: bool = True
     audio_devices_count: int = 0
-    winrt_ru_available: bool = False
     ocr_engine: str = "rapidocr"
 
     @property
@@ -133,19 +132,13 @@ class PreflightReport:
         for item in self.components:
             if item.status == "installed":
                 continue
-            if item.spec.required:
-                needed.append(item)
-            elif item.spec.id == "rapidocr_cyrillic" and self.ocr_engine == "rapidocr":
+            if item.spec.required or item.spec.id == "rapidocr_cyrillic":
                 needed.append(item)
         return needed
 
     @property
     def all_ready(self) -> bool:
-        if self.missing_for_launch:
-            return False
-        if self.ocr_engine == "winrt" and not self.winrt_ru_available:
-            return False
-        return True
+        return not self.missing_for_launch
 
 
 @dataclass
@@ -193,17 +186,6 @@ def validate_file_header(path: Path, kind: str) -> tuple[bool, str]:
         return True, "OK"
     except Exception as exc:
         return False, str(exc)
-
-
-def check_winrt_ru_ocr_available() -> bool:
-    try:
-        from winrt.windows.globalization import Language
-        from winrt.windows.media.ocr import OcrEngine
-
-        lang = Language("ru")
-        return bool(OcrEngine.is_language_supported(lang))
-    except Exception:
-        return False
 
 
 class DependencyManager:
@@ -292,13 +274,11 @@ class DependencyManager:
         results = [self.check_component(spec.id, verify_hash=verify_hash) for spec in self.manifest]
         writable = is_dir_writable(USER_ROOT)
         audio_cnt = len(list_output_devices())
-        winrt_ok = check_winrt_ru_ocr_available()
         return PreflightReport(
             components=results,
             writable_ok=writable,
             audio_devices_count=audio_cnt,
-            winrt_ru_available=winrt_ok,
-            ocr_engine=ocr_engine,
+            ocr_engine="rapidocr",
         )
 
     def install_local_file(self, comp_id: str, local_source: Path) -> tuple[bool, str]:

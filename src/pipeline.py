@@ -6,6 +6,7 @@ import queue
 import re
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
@@ -27,7 +28,12 @@ from src.debug_logger import DebugCaptureLogger
 from src.ducking import AutoDucker
 from src.ocr_engine import OcrEngineManager
 from src.punctuation import PunctuationRestorer
-from src.text_filter import StressDictManager, SubtitleTextFilter, normalize_text_base, parse_subtitle_utterances
+from src.text_filter import (
+    StressDictManager,
+    SubtitleTextFilter,
+    normalize_text_base,
+    parse_subtitle_utterances_with_bboxes,
+)
 from src.tts_engine import SileroTTSEngine
 from src.voice_manager import VoiceManager, speaker_display_name
 
@@ -169,6 +175,7 @@ class SubtitlePipeline(QObject):
         self._status_audio_cache: dict[str, np.ndarray] = {}
 
         # Лёгкая потокобезопасная история последних реплик для быстрого редактирования со смартфона по Wi-Fi
+        self.mobile_session_id: str = uuid.uuid4().hex[:12]
         self._mobile_history_lock = threading.Lock()
         self._mobile_event_seq: int = 0
         self._recent_mobile_history: collections.deque[dict] = collections.deque(maxlen=30)
@@ -285,27 +292,37 @@ class SubtitlePipeline(QObject):
         self.player.play(scaled, interrupt=True, trigger_ducking=False, is_status=True)
 
     def load_models_async(self) -> None:
-        self.status_changed.emit("loading", "Загрузка Silero 5.6 и OCR...")
+        self.status_changed.emit("loading", "Запуск...")
         self.loading_progress.emit("1/3  Подготовка аудиопотока WASAPI и PyTorch CPU...")
 
         def _loader() -> None:
             set_current_thread_below_normal()
             try:
+                if self._shutting_down:
+                    return
                 self.player.open_stream()
+                if self._shutting_down:
+                    return
                 self.loading_progress.emit("2/3  Загрузка нейронной модели Silero TTS v5.6 и прогрев диктора...")
                 self.tts.load(
                     model_path=self.config.silero_model_path or None,
                     num_threads=self.config.torch_num_threads,
                 )
+                if self._shutting_down:
+                    return
                 self.voice_manager.set_available_speakers(self.tts.speakers)
 
                 self.loading_progress.emit("3/3  Прогрев RapidOCR и подготовка голосовых оповещений...")
                 self._prebuild_status_announcements()
+                if self._shutting_down:
+                    return
                 try:
                     self.ocr.warmup()
                     self._ocr_warmed = True
                 except Exception:
                     pass
+                if self._shutting_down:
+                    return
 
                 self.change_detector.reset()
                 self.model_ready.emit(self.tts.speakers, self.tts.load_time_ms)
@@ -316,9 +333,11 @@ class SubtitlePipeline(QObject):
                     self.tts.load_time_ms,
                     f"Silero 5.6 + OCR готовы (warmup {self.tts.warmup_time_ms:.0f}мс)",
                 )
-                if not self._running:
+                if not self._running and not self._shutting_down:
                     self.status_changed.emit("idle", "Готов")
             except Exception as exc:
+                if self._shutting_down:
+                    return
                 self.status_changed.emit("error", "Модель не готова")
                 self.error_occurred.emit(str(exc))
                 self._emit_log("error", "—", "—", 0.0, f"Silero: {exc}")
@@ -653,7 +672,10 @@ class SubtitlePipeline(QObject):
         if not ocr_res.lines:
             return
 
-        parsed = parse_subtitle_utterances([ln.text for ln in ocr_res.lines])
+        parsed = parse_subtitle_utterances_with_bboxes(
+            [(ln.text, ln.bbox) for ln in ocr_res.lines],
+            rejected_boxes=ocr_res.rejected_boxes,
+        )
         if not parsed:
             return
 
@@ -901,10 +923,23 @@ class SubtitlePipeline(QObject):
             )
         utt.debug_frame = None
 
-    def shutdown(self) -> None:
-        if self._shutting_down:
-            return
+    def request_shutdown(self) -> None:
+        """Мгновенно сигнализирует фоновым загрузчикам и рабочим потокам о выходе."""
         self._shutting_down = True
+        self._running = False
+        self._generation += 1
+        self._stop_event.set()
+        self._frame_ready_event.set()
+        self._drain_queues()
+        self._tts_queue.put(None)
+        self.player.stop_immediately()
+
+    def shutdown(self) -> None:
+        already = self._shutting_down
+        self.request_shutdown()
+        if already and not self._running and self._capture_thread is None and self._ocr_thread is None and self._tts_thread is None:
+            # Тем не менее гарантируем закрытие ресурсов, если shutdown вызывается повторно после request_shutdown
+            pass
         try:
             self.stop(announce=False)
         finally:

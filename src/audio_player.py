@@ -124,6 +124,7 @@ class AudioPlayer:
         self._on_state_cb = on_playback_state_changed
 
         self._lock = threading.Lock()
+        self._stream_lock = threading.Lock()
         self._stream: Optional[sd.OutputStream] = None
         self._stream_sr: int = sample_rate
         self._stream_channels: int = 2
@@ -199,7 +200,10 @@ class AudioPlayer:
 
     def open_stream(self) -> None:
         try:
-            self._ensure_stream()
+            with self._stream_lock:
+                if self._closed:
+                    return
+                self._ensure_stream()
         except Exception:
             pass
 
@@ -258,14 +262,17 @@ class AudioPlayer:
             self._stream = None
 
     def set_device(self, device_name: Optional[str]) -> None:
-        with self._lock:
+        with self._stream_lock:
             if device_name == self.device_name:
                 return
             self.device_name = device_name
             was_open = self._stream is not None
             self._close_stream()
-        if was_open:
-            self.open_stream()
+            if was_open and not self._closed:
+                try:
+                    self._ensure_stream()
+                except Exception:
+                    pass
 
     def _write_mono_to_out(self, outdata: np.ndarray, start: int, segment: np.ndarray) -> None:
         end = start + segment.size
@@ -345,10 +352,15 @@ class AudioPlayer:
         is_status: bool = False,
         interrupt_only_if_status: bool = False,
     ) -> None:
+        if self._closed:
+            return
         raw = np.ascontiguousarray(audio, dtype=np.float32).reshape(-1)
         if raw.size == 0:
             return
-        self._ensure_stream()
+        with self._stream_lock:
+            if self._closed:
+                return
+            self._ensure_stream()
         buf = _resample_to_rate(raw, self.sample_rate, self._stream_sr)
         with self._lock:
             effective_interrupt = interrupt or (
@@ -415,9 +427,10 @@ class AudioPlayer:
             self._notify_state_async(False)
 
     def close(self) -> None:
-        self.stop_immediately()
         self._closed = True
-        with self._lock:
+        self.stop_immediately()
+        # _stream_lock отделён от _lock, чтобы stream.stop() не вызывал AB-BA deadlock с _audio_callback
+        with self._stream_lock:
             self._close_stream()
         if self._notifier_thread is not None and self._notifier_thread.is_alive():
             self._notify_queue.put(None)

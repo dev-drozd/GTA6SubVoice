@@ -5,9 +5,10 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QSize, Qt, QThread, QUrl, Signal
+from PySide6.QtCore import QSize, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
+    QApplication,
     QDialog,
     QFrame,
     QHBoxLayout,
@@ -248,11 +249,16 @@ class UpdateDialog(QDialog):
     def _on_download_finished(self, source_app_dir: Path, staging_root: Path) -> None:
         self.progress_bar.setValue(100)
         self.lbl_progress.setText("Перезапуск и установка обновления...")
+        QApplication.processEvents()
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.wait(2500)
         try:
             launch_self_update(source_app_dir=source_app_dir, staging_root=staging_root)
+            self.hide()
             self.accept()
+            QApplication.processEvents()
             if callable(self._on_restart_requested):
-                self._on_restart_requested()
+                QTimer.singleShot(50, self._on_restart_requested)
         except Exception as exc:
             self._worker = None
             self.btn_update.setEnabled(is_self_update_supported())
